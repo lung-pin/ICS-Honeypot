@@ -602,6 +602,18 @@ SERVER_DISABLE_KIBANA=0
 SERVER_DAEMON_LOG_MODE=errors
 SERVER_DAEMON_LOG_MAX_BYTES=10485760
 SERVER_DAEMON_LOG_BACKUP_COUNT=3
+SERVER_EXTERNAL_ARCHIVE_ENABLED=true
+SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES=512
+SERVER_DISK_GUARD_ENABLED=true
+SERVER_DISK_USAGE_MAX_PERCENT=80
+SERVER_DISK_USAGE_TARGET_PERCENT=75
+SERVER_DISK_GUARD_PATH=/
+SERVER_DISK_GUARD_INTERVAL_SECONDS=300
+SERVER_DISK_GUARD_BATCH_ROWS=5000
+SERVER_DISK_GUARD_MAX_DB_BATCHES=10
+SERVER_DISK_GUARD_DELETE_ES_INDICES=true
+SERVER_DISK_GUARD_ES_KEEP_INDICES=1
+ELASTICSEARCH_URL=http://127.0.0.1:9200
 
 # Server Public URL (set to EC2 public IP for remote deployment)
 # Leave empty for auto-detect from request headers.
@@ -667,6 +679,32 @@ SERVER_DAEMON_LOG_BACKUP_COUNT=3
 EOF
             ok "Added SERVER_DAEMON_LOG_BACKUP_COUNT default to server/.env."
         fi
+        if ! grep -qE "^SERVER_DISK_GUARD_ENABLED=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+
+# Disk guard: delete oldest data when host disk usage crosses the threshold.
+SERVER_DISK_GUARD_ENABLED=true
+SERVER_DISK_USAGE_MAX_PERCENT=80
+SERVER_DISK_USAGE_TARGET_PERCENT=75
+SERVER_DISK_GUARD_PATH=/
+SERVER_DISK_GUARD_INTERVAL_SECONDS=300
+SERVER_DISK_GUARD_BATCH_ROWS=5000
+SERVER_DISK_GUARD_MAX_DB_BATCHES=10
+SERVER_DISK_GUARD_DELETE_ES_INDICES=true
+SERVER_DISK_GUARD_ES_KEEP_INDICES=1
+ELASTICSEARCH_URL=http://127.0.0.1:9200
+EOF
+            ok "Added disk guard defaults to server/.env."
+        fi
+        if ! grep -qE "^SERVER_EXTERNAL_ARCHIVE_ENABLED=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+
+# Permanent compact archive for real external attacker IPs.
+SERVER_EXTERNAL_ARCHIVE_ENABLED=true
+SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES=512
+EOF
+            ok "Added external archive defaults to server/.env."
+        fi
         if ! grep -qE "^DATABASE_URL=" "$SCRIPT_DIR/.env"; then
             cat >> "$SCRIPT_DIR/.env" <<'EOF'
 
@@ -692,10 +730,37 @@ EOF
 # Honeypot Client Agent Configuration
 # API_KEY must match the server's API_KEY
 API_KEY=${SERVER_API_KEY:-change_me}
+DROP_PRIVATE_IP_LOGS=true
+CLIENT_DISK_GUARD_ENABLED=true
+CLIENT_DISK_USAGE_MAX_PERCENT=80
+CLIENT_DISK_USAGE_TARGET_PERCENT=75
+CLIENT_DISK_GUARD_PATH=/
+CLIENT_DISK_GUARD_INTERVAL_SECONDS=300
+CLIENT_DISK_GUARD_BATCH_ROWS=5000
+CLIENT_DISK_GUARD_MAX_DB_BATCHES=10
+CLIENT_DISK_GUARD_MIN_FILE_AGE_SECONDS=600
+CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true
 EOF
         ok "Created client/.env (API_KEY synced from server)"
     else
         ok "client/.env already exists."
+        if ! grep -qE "^CLIENT_DISK_GUARD_ENABLED=" "$REPO_ROOT/client/.env"; then
+            cat >> "$REPO_ROOT/client/.env" <<'EOF'
+
+# Disk guard: delete oldest local data when host disk usage crosses the threshold.
+DROP_PRIVATE_IP_LOGS=true
+CLIENT_DISK_GUARD_ENABLED=true
+CLIENT_DISK_USAGE_MAX_PERCENT=80
+CLIENT_DISK_USAGE_TARGET_PERCENT=75
+CLIENT_DISK_GUARD_PATH=/
+CLIENT_DISK_GUARD_INTERVAL_SECONDS=300
+CLIENT_DISK_GUARD_BATCH_ROWS=5000
+CLIENT_DISK_GUARD_MAX_DB_BATCHES=10
+CLIENT_DISK_GUARD_MIN_FILE_AGE_SECONDS=600
+CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true
+EOF
+            ok "Added disk guard defaults to client/.env."
+        fi
     fi
 
     # Client config.json

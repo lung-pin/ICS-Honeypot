@@ -19,6 +19,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timedelta
 from postgres_database import PostgresServerDB
@@ -132,6 +133,14 @@ def _load_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _load_percent_env(name: str, default: int) -> int:
+    value = _load_positive_int_env(name, default)
+    if not 1 <= value <= 100:
+        print(f"[maintenance] Invalid {name}={value!r}; using {default}")
+        return default
+    return value
+
+
 SERVER_API_ONLY = (
     _load_bool_env("SERVER_API_ONLY", False)
     or _load_bool_env("SERVER_DISABLE_WEB", False)
@@ -148,6 +157,30 @@ SERVER_LOG_CLEANUP_START_DELAY_SECONDS = max(
     0,
     _load_positive_int_env("SERVER_LOG_CLEANUP_START_DELAY_SECONDS", 5),
 )
+SERVER_DISK_GUARD_ENABLED = _load_bool_env("SERVER_DISK_GUARD_ENABLED", True)
+SERVER_DISK_USAGE_MAX_PERCENT = _load_percent_env("SERVER_DISK_USAGE_MAX_PERCENT", 80)
+SERVER_DISK_USAGE_TARGET_PERCENT = _load_percent_env("SERVER_DISK_USAGE_TARGET_PERCENT", 75)
+if SERVER_DISK_USAGE_TARGET_PERCENT >= SERVER_DISK_USAGE_MAX_PERCENT:
+    SERVER_DISK_USAGE_TARGET_PERCENT = max(1, SERVER_DISK_USAGE_MAX_PERCENT - 5)
+SERVER_DISK_GUARD_PATH = os.environ.get("SERVER_DISK_GUARD_PATH", "/").strip() or "/"
+SERVER_DISK_GUARD_INTERVAL_SECONDS = max(
+    60,
+    _load_positive_int_env("SERVER_DISK_GUARD_INTERVAL_SECONDS", 300),
+)
+SERVER_DISK_GUARD_BATCH_ROWS = max(
+    1,
+    _load_positive_int_env("SERVER_DISK_GUARD_BATCH_ROWS", 5000),
+)
+SERVER_DISK_GUARD_MAX_DB_BATCHES = max(
+    1,
+    _load_positive_int_env("SERVER_DISK_GUARD_MAX_DB_BATCHES", 10),
+)
+SERVER_DISK_GUARD_DELETE_ES_INDICES = _load_bool_env("SERVER_DISK_GUARD_DELETE_ES_INDICES", True)
+SERVER_DISK_GUARD_ES_KEEP_INDICES = max(
+    0,
+    _load_positive_int_env("SERVER_DISK_GUARD_ES_KEEP_INDICES", 1),
+)
+ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://127.0.0.1:9200").strip().rstrip("/")
 SERVER_UVICORN_LOG_LEVEL = os.environ.get("SERVER_UVICORN_LOG_LEVEL", "warning").strip().lower() or "warning"
 if SERVER_UVICORN_LOG_LEVEL not in {"critical", "error", "warning", "info", "debug", "trace"}:
     print(f"[maintenance] Invalid SERVER_UVICORN_LOG_LEVEL={SERVER_UVICORN_LOG_LEVEL!r}; using warning")
@@ -254,6 +287,174 @@ def _cleanup_old_server_log_files() -> Dict[str, Any]:
     }
 
 
+def _disk_usage_for_path(path: str) -> Dict[str, Any]:
+    check_path = path
+    if not os.path.exists(check_path):
+        check_path = "/"
+    usage = shutil.disk_usage(check_path)
+    # Match the percentage operators see in `df`: reserved blocks are not
+    # counted as generally available space, so use used / (used + available).
+    usable_total = usage.used + usage.free
+    percent = (usage.used / usable_total * 100) if usable_total else 0
+    return {
+        "path": check_path,
+        "total": usage.total,
+        "used": usage.used,
+        "free": usage.free,
+        "usable_total": usable_total,
+        "percent": percent,
+    }
+
+
+def _is_disk_under_target() -> bool:
+    return _disk_usage_for_path(SERVER_DISK_GUARD_PATH)["percent"] <= SERVER_DISK_USAGE_TARGET_PERCENT
+
+
+def _delete_oldest_server_pressure_files() -> Dict[str, Any]:
+    candidates = []
+    for directory, patterns in (
+        (Path(BASE_DIR) / "logs", ["*.json"]),
+        (Path(BASE_DIR), ["server.log.*"]),
+    ):
+        if not directory.exists():
+            continue
+        for pattern in patterns:
+            for path in directory.glob(pattern):
+                try:
+                    if path.is_file():
+                        stat = path.stat()
+                        candidates.append((stat.st_mtime, path, stat.st_size))
+                except OSError:
+                    continue
+
+    deleted_files = 0
+    deleted_bytes = 0
+    errors = []
+    for _, path, size in sorted(candidates, key=lambda item: item[0]):
+        if _is_disk_under_target():
+            break
+        try:
+            path.unlink()
+            deleted_files += 1
+            deleted_bytes += size
+        except OSError as exc:
+            errors.append(f"{path}: {exc}")
+    return {
+        "files": deleted_files,
+        "bytes": deleted_bytes,
+        "errors": errors,
+    }
+
+
+def _elasticsearch_json(path: str, method: str = "GET") -> Any:
+    if not ELASTICSEARCH_URL:
+        raise RuntimeError("ELASTICSEARCH_URL is empty")
+    request = urllib.request.Request(
+        f"{ELASTICSEARCH_URL}{path}",
+        method=method,
+        headers={"Accept": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    if not raw:
+        return {}
+    return json.loads(raw)
+
+
+def _delete_oldest_elasticsearch_indices() -> Dict[str, Any]:
+    if not SERVER_DISK_GUARD_DELETE_ES_INDICES:
+        return {"enabled": False, "indices": 0, "errors": []}
+
+    try:
+        indices = _elasticsearch_json("/_cat/indices/honeypot-*?format=json&h=index")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError, RuntimeError) as exc:
+        return {"enabled": True, "indices": 0, "errors": [f"elasticsearch index list failed: {exc}"]}
+
+    names = sorted(
+        item.get("index", "")
+        for item in indices
+        if isinstance(item, dict) and item.get("index")
+    )
+    if SERVER_DISK_GUARD_ES_KEEP_INDICES:
+        deletable = names[:-SERVER_DISK_GUARD_ES_KEEP_INDICES]
+    else:
+        deletable = names
+
+    deleted = 0
+    errors = []
+    for index_name in deletable:
+        if _is_disk_under_target():
+            break
+        encoded = urllib.parse.quote(index_name, safe="")
+        try:
+            _elasticsearch_json(f"/{encoded}", method="DELETE")
+            deleted += 1
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{index_name}: {exc}")
+            break
+
+    return {
+        "enabled": True,
+        "indices": deleted,
+        "errors": errors,
+    }
+
+
+async def _run_server_disk_guard_once() -> Dict[str, Any]:
+    if not SERVER_DISK_GUARD_ENABLED:
+        return {"enabled": False}
+
+    before = _disk_usage_for_path(SERVER_DISK_GUARD_PATH)
+    if before["percent"] < SERVER_DISK_USAGE_MAX_PERCENT:
+        return {"enabled": True, "triggered": False, "before": before}
+
+    file_stats = _delete_oldest_server_pressure_files()
+    es_stats = {"enabled": SERVER_DISK_GUARD_DELETE_ES_INDICES, "indices": 0, "errors": []}
+    if not _is_disk_under_target():
+        es_stats = _delete_oldest_elasticsearch_indices()
+
+    db_stats = {"logs": 0, "whitelist_logs": 0, "alerts": 0, "batches": 0}
+    while not _is_disk_under_target() and db_stats["batches"] < SERVER_DISK_GUARD_MAX_DB_BATCHES:
+        batch_stats = await db.delete_oldest_server_data(SERVER_DISK_GUARD_BATCH_ROWS)
+        db_stats["batches"] += 1
+        db_stats["logs"] += batch_stats.get("logs", 0)
+        db_stats["whitelist_logs"] += batch_stats.get("whitelist_logs", 0)
+        db_stats["alerts"] += batch_stats.get("alerts", 0)
+        if not (
+            batch_stats.get("logs", 0)
+            or batch_stats.get("whitelist_logs", 0)
+            or batch_stats.get("alerts", 0)
+        ):
+            break
+
+    after = _disk_usage_for_path(SERVER_DISK_GUARD_PATH)
+    print(
+        "[maintenance] server disk guard "
+        f"path={after['path']} "
+        f"before={before['percent']:.1f}% "
+        f"after={after['percent']:.1f}% "
+        f"max={SERVER_DISK_USAGE_MAX_PERCENT}% "
+        f"target={SERVER_DISK_USAGE_TARGET_PERCENT}% "
+        f"files={file_stats.get('files', 0)} "
+        f"file_bytes={file_stats.get('bytes', 0)} "
+        f"es_indices={es_stats.get('indices', 0)} "
+        f"db_logs={db_stats.get('logs', 0)} "
+        f"whitelist_logs={db_stats.get('whitelist_logs', 0)} "
+        f"alerts={db_stats.get('alerts', 0)}"
+    )
+    for error in (file_stats.get("errors", []) + es_stats.get("errors", []))[:5]:
+        print(f"[maintenance] server disk guard error: {error}")
+    return {
+        "enabled": True,
+        "triggered": True,
+        "before": before,
+        "after": after,
+        "files": file_stats,
+        "elasticsearch": es_stats,
+        "database": db_stats,
+    }
+
+
 async def _run_server_log_cleanup_once():
     db_stats = await db.delete_old_server_logs(SERVER_LOG_RETENTION_DAYS)
     file_stats = _cleanup_old_server_log_files()
@@ -293,29 +494,56 @@ async def _server_log_cleanup_loop():
         await asyncio.sleep(sleep_for)
 
 
+async def _server_disk_guard_loop():
+    if SERVER_LOG_CLEANUP_START_DELAY_SECONDS:
+        await asyncio.sleep(SERVER_LOG_CLEANUP_START_DELAY_SECONDS + 5)
+    while True:
+        sleep_for = SERVER_DISK_GUARD_INTERVAL_SECONDS
+        try:
+            await _run_server_disk_guard_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[maintenance] server disk guard failed: {exc}")
+            sleep_for = min(300, SERVER_DISK_GUARD_INTERVAL_SECONDS)
+        await asyncio.sleep(sleep_for)
+
+
 @app.on_event("startup")
 async def _start_server_log_cleanup_task():
-    if (
+    cleanup_enabled = not (
         SERVER_LOG_RETENTION_DAYS <= 0
         and SERVER_JSON_LOG_RETENTION_DAYS <= 0
         and SERVER_DAEMON_LOG_RETENTION_DAYS <= 0
-    ):
-        print("[maintenance] server log cleanup disabled because all retention settings are <= 0")
-        return
-    app.state.server_log_cleanup_task = asyncio.create_task(_server_log_cleanup_loop())
-    print(
-        "[maintenance] server log cleanup scheduled "
-        f"retention={SERVER_LOG_RETENTION_DAYS}d "
-        f"json_retention={SERVER_JSON_LOG_RETENTION_DAYS}d "
-        f"daemon_retention={SERVER_DAEMON_LOG_RETENTION_DAYS}d "
-        f"interval={SERVER_LOG_CLEANUP_INTERVAL_SECONDS}s"
     )
+    if not cleanup_enabled:
+        print("[maintenance] server log cleanup disabled because all retention settings are <= 0")
+    else:
+        app.state.server_log_cleanup_task = asyncio.create_task(_server_log_cleanup_loop())
+        print(
+            "[maintenance] server log cleanup scheduled "
+            f"retention={SERVER_LOG_RETENTION_DAYS}d "
+            f"json_retention={SERVER_JSON_LOG_RETENTION_DAYS}d "
+            f"daemon_retention={SERVER_DAEMON_LOG_RETENTION_DAYS}d "
+            f"interval={SERVER_LOG_CLEANUP_INTERVAL_SECONDS}s"
+        )
+    if SERVER_DISK_GUARD_ENABLED:
+        app.state.server_disk_guard_task = asyncio.create_task(_server_disk_guard_loop())
+        print(
+            "[maintenance] server disk guard scheduled "
+            f"path={SERVER_DISK_GUARD_PATH} "
+            f"max={SERVER_DISK_USAGE_MAX_PERCENT}% "
+            f"target={SERVER_DISK_USAGE_TARGET_PERCENT}% "
+            f"interval={SERVER_DISK_GUARD_INTERVAL_SECONDS}s"
+        )
 
 
 @app.on_event("shutdown")
 async def _stop_server_log_cleanup_task():
-    task = getattr(app.state, "server_log_cleanup_task", None)
-    if task:
+    for attr in ("server_log_cleanup_task", "server_disk_guard_task"):
+        task = getattr(app.state, attr, None)
+        if not task:
+            continue
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
@@ -1352,8 +1580,15 @@ async def recent_logs(
 
 
 @app.get("/api/dashboard_stats", dependencies=[Depends(require_session)])
-async def dashboard_stats():
-    return await db.get_dashboard_stats()
+async def dashboard_stats(
+    hide_agent_ips: bool = True,
+    hide_private_ips: bool = True,
+):
+    exclude_ips = await db.get_agent_ips() if hide_agent_ips else []
+    return await db.get_dashboard_stats(
+        exclude_ips=exclude_ips,
+        hide_private_ips=hide_private_ips,
+    )
 
 
 # ── IP-grouped log analysis (powers the panel below the Attack Map) ──
@@ -1463,6 +1698,40 @@ async def ip_details(ip: str, limit: int = 200):
 @app.get("/api/alerts", dependencies=[Depends(require_session)])
 async def list_alerts(limit: int = 200, ip: Optional[str] = None):
     return await db.get_alerts(limit=limit, ip=ip)
+
+
+@app.get("/api/external_archive", dependencies=[Depends(require_session)])
+async def external_attack_archive(
+    limit: int = 200,
+    page: int = 1,
+    search: Optional[str] = None,
+):
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 200), 1000))
+    offset = (page - 1) * limit
+    return await db.get_external_attack_archive(
+        limit=limit,
+        offset=offset,
+        search=(search or "").strip() or None,
+    )
+
+
+@app.get("/api/external_archive/daily", dependencies=[Depends(require_session)])
+async def external_attack_archive_daily(
+    ip: Optional[str] = None,
+    days: int = 30,
+    limit: int = 1000,
+):
+    return await db.get_external_attack_daily(
+        ip=(ip or "").strip() or None,
+        days=days,
+        limit=limit,
+    )
+
+
+@app.post("/api/admin/rebuild_external_archive", dependencies=[Depends(require_session)])
+async def rebuild_external_attack_archive():
+    return await db.rebuild_external_attack_archive()
 
 
 # ── External alert ingest (ElastAlert webhook, etc.) ──

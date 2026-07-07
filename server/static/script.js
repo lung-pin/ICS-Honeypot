@@ -164,7 +164,11 @@ async function loadStats() {
     const countElem = document.getElementById("active-agents-count");
     if (countElem) countElem.textContent = agents.filter((agent) => agent.status === "Online").length;
     
-    const statsReq = fetch(`${API_BASE}/dashboard_stats`).then(r => r.json()).catch(() => null);
+    const statsParams = new URLSearchParams({
+        hide_agent_ips: "true",
+        hide_private_ips: "true",
+    });
+    const statsReq = fetch(`${API_BASE}/dashboard_stats?${statsParams.toString()}`).then(r => r.json()).catch(() => null);
     statsReq.then(stats => {
         if (!stats) return;
         const totalElem = document.getElementById("total-logs-count");

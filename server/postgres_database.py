@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
@@ -34,6 +35,14 @@ def _env_flag(name, default=True):
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name, default):
+    raw = os.environ.get(name, str(default)).strip() or str(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 def _is_internal_ip(ip):
     if not ip:
         return False
@@ -50,6 +59,8 @@ class PostgresServerDB:
         self._pool = None
         self._init_lock = asyncio.Lock()
         self.drop_private_ip_logs = _env_flag("DROP_PRIVATE_IP_LOGS", True)
+        self.external_archive_enabled = _env_flag("SERVER_EXTERNAL_ARCHIVE_ENABLED", True)
+        self.external_archive_sample_bytes = max(0, _env_int("SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES", 512))
         try:
             self.agent_offline_after_seconds = int(os.environ.get("AGENT_OFFLINE_AFTER_SECONDS", "300"))
         except ValueError:
@@ -149,6 +160,37 @@ class PostgresServerDB:
                     max_severity INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS external_attack_archive (
+                    ip TEXT PRIMARY KEY,
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    total_packets BIGINT NOT NULL DEFAULT 0,
+                    alert_count BIGINT NOT NULL DEFAULT 0,
+                    max_severity INTEGER NOT NULL DEFAULT 0,
+                    protocols TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                    node_ids TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                    signature_ids INTEGER[] NOT NULL DEFAULT ARRAY[]::INTEGER[],
+                    categories TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                    sources TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+                    sample_request_preview TEXT,
+                    sample_payload_sha256 TEXT,
+                    sample_protocol TEXT,
+                    updated_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS external_attack_daily (
+                    day TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    protocol TEXT NOT NULL DEFAULT '',
+                    node_id TEXT NOT NULL DEFAULT '',
+                    packet_count BIGINT NOT NULL DEFAULT 0,
+                    alert_count BIGINT NOT NULL DEFAULT 0,
+                    max_severity INTEGER NOT NULL DEFAULT 0,
+                    first_seen TEXT,
+                    last_seen TEXT,
+                    PRIMARY KEY (day, ip, protocol, node_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_logs_ip_id ON logs(attacker_ip, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_logs_id_desc ON logs(id DESC);
                 CREATE INDEX IF NOT EXISTS idx_logs_ts_ip ON logs(timestamp, attacker_ip);
@@ -163,6 +205,9 @@ class PostgresServerDB:
                 CREATE INDEX IF NOT EXISTS idx_alerts_ts_ip ON alerts(timestamp, attacker_ip);
                 CREATE INDEX IF NOT EXISTS idx_alerts_ip_ts_desc ON alerts(attacker_ip, timestamp DESC) WHERE attacker_ip IS NOT NULL AND attacker_ip != '';
                 CREATE INDEX IF NOT EXISTS idx_ip_summaries_last_seen ON ip_summaries(last_seen DESC, ip);
+                CREATE INDEX IF NOT EXISTS idx_external_attack_archive_last_seen ON external_attack_archive(last_seen DESC, ip);
+                CREATE INDEX IF NOT EXISTS idx_external_attack_archive_alert_count ON external_attack_archive(alert_count DESC, ip);
+                CREATE INDEX IF NOT EXISTS idx_external_attack_daily_day_ip ON external_attack_daily(day DESC, ip);
                 """
             )
             for table in ("logs", "whitelist_logs", "alerts"):
@@ -534,6 +579,329 @@ class PostgresServerDB:
             severity,
         )
 
+    @staticmethod
+    def _day_from_timestamp(timestamp):
+        if not timestamp:
+            return datetime.now(timezone.utc).date().isoformat()
+        text = str(timestamp)
+        try:
+            normalized = text.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized).date().isoformat()
+        except ValueError:
+            return text[:10] if len(text) >= 10 else datetime.now(timezone.utc).date().isoformat()
+
+    def _request_preview_and_hash(self, request_data):
+        if request_data is None:
+            return None, None
+        if isinstance(request_data, bytes):
+            raw = request_data
+            text = request_data.hex()
+        else:
+            text = str(request_data)
+            raw = text.encode("utf-8", errors="replace")
+        digest = hashlib.sha256(raw).hexdigest() if raw else None
+        if not text:
+            return None, digest
+        if self.external_archive_sample_bytes <= 0:
+            return None, digest
+        return text[: self.external_archive_sample_bytes], digest
+
+    async def _agent_ip_set(self, executor):
+        rows = await executor.fetch("SELECT DISTINCT ip FROM agents WHERE ip IS NOT NULL AND ip != ''")
+        return {row["ip"] for row in rows if row["ip"]}
+
+    def _should_archive_external_ip(self, ip, agent_ips):
+        return bool(ip) and not _is_internal_ip(ip) and str(ip) not in agent_ips
+
+    def _merge_external_log_archive_rows(self, rows, agent_ips):
+        summaries = {}
+        daily = {}
+        for timestamp, node_id, protocol, attacker_ip, req, _resp, _metadata in rows:
+            if not self._should_archive_external_ip(attacker_ip, agent_ips):
+                continue
+            protocol = protocol or ""
+            node_id = node_id or ""
+            summary = summaries.setdefault(
+                attacker_ip,
+                {
+                    "count": 0,
+                    "protocols": set(),
+                    "node_ids": set(),
+                    "first_seen": None,
+                    "last_seen": None,
+                    "sample_request_preview": None,
+                    "sample_payload_sha256": None,
+                    "sample_protocol": None,
+                },
+            )
+            summary["count"] += 1
+            if protocol:
+                summary["protocols"].add(protocol)
+            if node_id:
+                summary["node_ids"].add(node_id)
+            if timestamp and (summary["first_seen"] is None or timestamp < summary["first_seen"]):
+                summary["first_seen"] = timestamp
+            if timestamp and (summary["last_seen"] is None or timestamp > summary["last_seen"]):
+                summary["last_seen"] = timestamp
+            if summary["sample_request_preview"] is None and req:
+                preview, digest = self._request_preview_and_hash(req)
+                summary["sample_request_preview"] = preview
+                summary["sample_payload_sha256"] = digest
+                summary["sample_protocol"] = protocol
+
+            day = self._day_from_timestamp(timestamp)
+            key = (day, attacker_ip, protocol, node_id)
+            day_summary = daily.setdefault(
+                key,
+                {
+                    "packet_count": 0,
+                    "first_seen": None,
+                    "last_seen": None,
+                },
+            )
+            day_summary["packet_count"] += 1
+            if timestamp and (day_summary["first_seen"] is None or timestamp < day_summary["first_seen"]):
+                day_summary["first_seen"] = timestamp
+            if timestamp and (day_summary["last_seen"] is None or timestamp > day_summary["last_seen"]):
+                day_summary["last_seen"] = timestamp
+
+        archive_rows = [
+            (
+                ip,
+                data["first_seen"],
+                data["last_seen"],
+                data["count"],
+                sorted(data["protocols"]),
+                sorted(data["node_ids"]),
+                data["sample_request_preview"],
+                data["sample_payload_sha256"],
+                data["sample_protocol"],
+                datetime.now(timezone.utc).isoformat(),
+            )
+            for ip, data in summaries.items()
+        ]
+        daily_rows = [
+            (
+                day,
+                ip,
+                protocol,
+                node_id,
+                data["packet_count"],
+                data["first_seen"],
+                data["last_seen"],
+            )
+            for (day, ip, protocol, node_id), data in daily.items()
+        ]
+        return archive_rows, daily_rows
+
+    async def _upsert_external_attack_log_archive(self, executor, rows):
+        if not self.external_archive_enabled or not rows:
+            return
+        agent_ips = await self._agent_ip_set(executor)
+        archive_rows, daily_rows = self._merge_external_log_archive_rows(rows, agent_ips)
+        if archive_rows:
+            await executor.executemany(
+                """
+                INSERT INTO external_attack_archive
+                    (ip, first_seen, last_seen, total_packets, protocols, node_ids,
+                     sample_request_preview, sample_payload_sha256, sample_protocol, updated_at)
+                VALUES ($1,$2,$3,$4,$5::text[],$6::text[],$7,$8,$9,$10)
+                ON CONFLICT (ip) DO UPDATE SET
+                    total_packets = external_attack_archive.total_packets + EXCLUDED.total_packets,
+                    protocols = (
+                        SELECT ARRAY(
+                            SELECT DISTINCT value
+                            FROM unnest(external_attack_archive.protocols || EXCLUDED.protocols) AS value
+                            WHERE value IS NOT NULL AND value != ''
+                            ORDER BY value
+                        )
+                    ),
+                    node_ids = (
+                        SELECT ARRAY(
+                            SELECT DISTINCT value
+                            FROM unnest(external_attack_archive.node_ids || EXCLUDED.node_ids) AS value
+                            WHERE value IS NOT NULL AND value != ''
+                            ORDER BY value
+                        )
+                    ),
+                    first_seen = CASE
+                        WHEN external_attack_archive.first_seen IS NULL THEN EXCLUDED.first_seen
+                        WHEN EXCLUDED.first_seen IS NULL THEN external_attack_archive.first_seen
+                        WHEN EXCLUDED.first_seen < external_attack_archive.first_seen THEN EXCLUDED.first_seen
+                        ELSE external_attack_archive.first_seen
+                    END,
+                    last_seen = CASE
+                        WHEN external_attack_archive.last_seen IS NULL THEN EXCLUDED.last_seen
+                        WHEN EXCLUDED.last_seen IS NULL THEN external_attack_archive.last_seen
+                        WHEN EXCLUDED.last_seen > external_attack_archive.last_seen THEN EXCLUDED.last_seen
+                        ELSE external_attack_archive.last_seen
+                    END,
+                    sample_request_preview = COALESCE(external_attack_archive.sample_request_preview, EXCLUDED.sample_request_preview),
+                    sample_payload_sha256 = COALESCE(external_attack_archive.sample_payload_sha256, EXCLUDED.sample_payload_sha256),
+                    sample_protocol = COALESCE(external_attack_archive.sample_protocol, EXCLUDED.sample_protocol),
+                    updated_at = EXCLUDED.updated_at
+                """,
+                archive_rows,
+            )
+        if daily_rows:
+            await executor.executemany(
+                """
+                INSERT INTO external_attack_daily
+                    (day, ip, protocol, node_id, packet_count, first_seen, last_seen)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                ON CONFLICT (day, ip, protocol, node_id) DO UPDATE SET
+                    packet_count = external_attack_daily.packet_count + EXCLUDED.packet_count,
+                    first_seen = CASE
+                        WHEN external_attack_daily.first_seen IS NULL THEN EXCLUDED.first_seen
+                        WHEN EXCLUDED.first_seen IS NULL THEN external_attack_daily.first_seen
+                        WHEN EXCLUDED.first_seen < external_attack_daily.first_seen THEN EXCLUDED.first_seen
+                        ELSE external_attack_daily.first_seen
+                    END,
+                    last_seen = CASE
+                        WHEN external_attack_daily.last_seen IS NULL THEN EXCLUDED.last_seen
+                        WHEN EXCLUDED.last_seen IS NULL THEN external_attack_daily.last_seen
+                        WHEN EXCLUDED.last_seen > external_attack_daily.last_seen THEN EXCLUDED.last_seen
+                        ELSE external_attack_daily.last_seen
+                    END
+                """,
+                daily_rows,
+            )
+
+    async def _upsert_external_attack_alert_archive(self, executor, alert):
+        if not self.external_archive_enabled:
+            return
+        attacker_ip = alert.get("attacker_ip")
+        agent_ips = await self._agent_ip_set(executor)
+        if not self._should_archive_external_ip(attacker_ip, agent_ips):
+            return
+
+        timestamp = alert.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        protocol = alert.get("protocol") or ""
+        node_id = alert.get("node_id") or ""
+        severity = alert.get("severity") or 3
+        signature_id = alert.get("signature_id")
+        try:
+            signature_ids = [int(signature_id)] if signature_id not in (None, "") else []
+        except (TypeError, ValueError):
+            signature_ids = []
+        category = alert.get("category") or ""
+        source = alert.get("source") or ""
+        now = datetime.now(timezone.utc).isoformat()
+
+        await executor.execute(
+            """
+            INSERT INTO external_attack_archive
+                (ip, first_seen, last_seen, alert_count, max_severity, protocols, node_ids,
+                 signature_ids, categories, sources, updated_at)
+            VALUES ($1,$2,$3,1,$4,$5::text[],$6::text[],$7::integer[],$8::text[],$9::text[],$10)
+            ON CONFLICT (ip) DO UPDATE SET
+                alert_count = external_attack_archive.alert_count + 1,
+                max_severity = CASE
+                    WHEN external_attack_archive.max_severity = 0 THEN EXCLUDED.max_severity
+                    WHEN EXCLUDED.max_severity = 0 THEN external_attack_archive.max_severity
+                    WHEN EXCLUDED.max_severity < external_attack_archive.max_severity THEN EXCLUDED.max_severity
+                    ELSE external_attack_archive.max_severity
+                END,
+                protocols = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(external_attack_archive.protocols || EXCLUDED.protocols) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                node_ids = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(external_attack_archive.node_ids || EXCLUDED.node_ids) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                signature_ids = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(external_attack_archive.signature_ids || EXCLUDED.signature_ids) AS value
+                        WHERE value IS NOT NULL
+                        ORDER BY value
+                    )
+                ),
+                categories = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(external_attack_archive.categories || EXCLUDED.categories) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                sources = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(external_attack_archive.sources || EXCLUDED.sources) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                first_seen = CASE
+                    WHEN external_attack_archive.first_seen IS NULL THEN EXCLUDED.first_seen
+                    WHEN EXCLUDED.first_seen IS NULL THEN external_attack_archive.first_seen
+                    WHEN EXCLUDED.first_seen < external_attack_archive.first_seen THEN EXCLUDED.first_seen
+                    ELSE external_attack_archive.first_seen
+                END,
+                last_seen = CASE
+                    WHEN external_attack_archive.last_seen IS NULL THEN EXCLUDED.last_seen
+                    WHEN EXCLUDED.last_seen IS NULL THEN external_attack_archive.last_seen
+                    WHEN EXCLUDED.last_seen > external_attack_archive.last_seen THEN EXCLUDED.last_seen
+                    ELSE external_attack_archive.last_seen
+                END,
+                updated_at = EXCLUDED.updated_at
+            """,
+            attacker_ip,
+            timestamp,
+            timestamp,
+            severity,
+            [protocol] if protocol else [],
+            [node_id] if node_id else [],
+            signature_ids,
+            [category] if category else [],
+            [source] if source else [],
+            now,
+        )
+        await executor.execute(
+            """
+            INSERT INTO external_attack_daily
+                (day, ip, protocol, node_id, alert_count, max_severity, first_seen, last_seen)
+            VALUES ($1,$2,$3,$4,1,$5,$6,$7)
+            ON CONFLICT (day, ip, protocol, node_id) DO UPDATE SET
+                alert_count = external_attack_daily.alert_count + 1,
+                max_severity = CASE
+                    WHEN external_attack_daily.max_severity = 0 THEN EXCLUDED.max_severity
+                    WHEN EXCLUDED.max_severity = 0 THEN external_attack_daily.max_severity
+                    WHEN EXCLUDED.max_severity < external_attack_daily.max_severity THEN EXCLUDED.max_severity
+                    ELSE external_attack_daily.max_severity
+                END,
+                first_seen = CASE
+                    WHEN external_attack_daily.first_seen IS NULL THEN EXCLUDED.first_seen
+                    WHEN EXCLUDED.first_seen IS NULL THEN external_attack_daily.first_seen
+                    WHEN EXCLUDED.first_seen < external_attack_daily.first_seen THEN EXCLUDED.first_seen
+                    ELSE external_attack_daily.first_seen
+                END,
+                last_seen = CASE
+                    WHEN external_attack_daily.last_seen IS NULL THEN EXCLUDED.last_seen
+                    WHEN EXCLUDED.last_seen IS NULL THEN external_attack_daily.last_seen
+                    WHEN EXCLUDED.last_seen > external_attack_daily.last_seen THEN EXCLUDED.last_seen
+                    ELSE external_attack_daily.last_seen
+                END
+            """,
+            self._day_from_timestamp(timestamp),
+            attacker_ip,
+            protocol,
+            node_id,
+            severity,
+            timestamp,
+            timestamp,
+        )
+
     async def insert_logs(self, node_id, logs):
         pool = await self._ensure_pool()
         rows = []
@@ -563,6 +931,7 @@ class PostgresServerDB:
                 async with conn.transaction():
                     await conn.executemany(sql, rows)
                     await self._upsert_ip_log_summaries(conn, rows)
+                    await self._upsert_external_attack_log_archive(conn, rows)
         except Exception as exc:
             if not _is_unique_violation(exc):
                 raise
@@ -571,6 +940,7 @@ class PostgresServerDB:
                 async with conn.transaction():
                     await conn.executemany(sql, rows)
                     await self._upsert_ip_log_summaries(conn, rows)
+                    await self._upsert_external_attack_log_archive(conn, rows)
         return len(rows)
 
     @staticmethod
@@ -619,15 +989,25 @@ class PostgresServerDB:
         )
         return [dict(row) for row in rows]
 
-    async def get_dashboard_stats(self):
+    async def get_dashboard_stats(self, exclude_ips=None, hide_private_ips=False):
         pool = await self._ensure_pool()
+        params = []
+        where = ["ip IS NOT NULL", "ip != ''"]
+        exclude_ips = [ip for ip in (exclude_ips or []) if ip]
+        if exclude_ips:
+            params.append(exclude_ips)
+            where.append(f"ip <> ALL(${len(params)}::text[])")
+        if hide_private_ips:
+            where.append(self._not_private_ip_sql("ip"))
         row = await pool.fetchrow(
-            """
+            f"""
             SELECT
                 COALESCE(SUM(total_packets), 0)::bigint AS total_logs,
                 COALESCE(SUM(alert_count), 0)::bigint AS total_alerts
             FROM ip_summaries
-            """
+            WHERE {' AND '.join(where)}
+            """,
+            *params,
         )
         if row:
             return {"total_logs": row["total_logs"], "total_alerts": row["total_alerts"]}
@@ -887,6 +1267,66 @@ class PostgresServerDB:
             "whitelist_logs": deleted_whitelist_logs,
             "alerts": deleted_alerts,
             "cutoff": cutoff,
+        }
+
+    async def delete_oldest_server_data(self, batch_size=5000):
+        """Delete the oldest attack, whitelist, and alert rows in bounded batches.
+
+        This is used by the disk guard when retention-by-days is not enough to
+        keep the host under the configured disk usage threshold.
+        """
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            batch_size = 5000
+        batch_size = max(1, min(batch_size, 100000))
+
+        pool = await self._ensure_pool()
+        deleted = {"logs": 0, "whitelist_logs": 0, "alerts": 0}
+
+        async def select_oldest(conn, table):
+            return await conn.fetch(
+                f"""
+                SELECT id, attacker_ip
+                FROM {table}
+                ORDER BY timestamp ASC NULLS FIRST, id ASC
+                LIMIT $1
+                """,
+                batch_size,
+            )
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "CREATE TEMP TABLE cleanup_ips (ip TEXT PRIMARY KEY) ON COMMIT DROP"
+                )
+                for table in ("logs", "whitelist_logs", "alerts"):
+                    rows = await select_oldest(conn, table)
+                    if not rows:
+                        continue
+                    ids = [row["id"] for row in rows]
+                    ips = [
+                        (row["attacker_ip"],)
+                        for row in rows
+                        if row["attacker_ip"]
+                    ]
+                    if ips:
+                        await conn.executemany(
+                            "INSERT INTO cleanup_ips (ip) VALUES ($1) ON CONFLICT DO NOTHING",
+                            ips,
+                        )
+                    deleted[table] = self._deleted_count(
+                        await conn.execute(
+                            f"DELETE FROM {table} WHERE id = ANY($1::bigint[])",
+                            ids,
+                        )
+                    )
+                if deleted["logs"] or deleted["alerts"]:
+                    await self._refresh_cleanup_ip_summaries(conn)
+
+        return {
+            "batch_size": batch_size,
+            **deleted,
         }
 
     async def delete_agent_logs(self, node_id):
@@ -1167,6 +1607,7 @@ class PostgresServerDB:
                 )
                 if row is not None:
                     await self._upsert_ip_alert_summary(conn, alert)
+                    await self._upsert_external_attack_alert_archive(conn, alert)
         return row is not None
 
     async def get_alerts(self, limit=200, ip=None):
@@ -1176,3 +1617,260 @@ class PostgresServerDB:
         else:
             rows = await pool.fetch("SELECT * FROM alerts ORDER BY id DESC LIMIT $1", limit)
         return [dict(row) for row in rows]
+
+    async def get_external_attack_archive(self, limit=200, offset=0, search=None):
+        pool = await self._ensure_pool()
+        limit = max(1, min(int(limit or 200), 1000))
+        offset = max(0, int(offset or 0))
+        params = []
+        where = ["ip IS NOT NULL", "ip != ''"]
+        if search:
+            params.append(f"%{search}%")
+            where.append(f"ip ILIKE ${len(params)}")
+        params.extend([limit, offset])
+        rows = await pool.fetch(
+            f"""
+            SELECT *
+            FROM external_attack_archive
+            WHERE {' AND '.join(where)}
+            ORDER BY last_seen DESC NULLS LAST, total_packets DESC, ip
+            LIMIT ${len(params) - 1}
+            OFFSET ${len(params)}
+            """,
+            *params,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_external_attack_daily(self, ip=None, days=30, limit=1000):
+        pool = await self._ensure_pool()
+        try:
+            days = max(1, min(int(days or 30), 3650))
+        except (TypeError, ValueError):
+            days = 30
+        try:
+            limit = max(1, min(int(limit or 1000), 5000))
+        except (TypeError, ValueError):
+            limit = 1000
+
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+        if ip:
+            rows = await pool.fetch(
+                """
+                SELECT *
+                FROM external_attack_daily
+                WHERE ip = $1 AND day >= $2
+                ORDER BY day DESC, packet_count DESC, alert_count DESC, protocol, node_id
+                LIMIT $3
+                """,
+                ip,
+                cutoff,
+                limit,
+            )
+        else:
+            rows = await pool.fetch(
+                """
+                SELECT *
+                FROM external_attack_daily
+                WHERE day >= $1
+                ORDER BY day DESC, packet_count DESC, alert_count DESC, ip
+                LIMIT $2
+                """,
+                cutoff,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def rebuild_external_attack_archive(self):
+        """Rebuild the permanent external archive from current hot logs/alerts.
+
+        This intentionally ignores private/internal IPs and registered Agent IPs.
+        It is meant for manual backfill after enabling the archive; normal writes
+        keep the archive updated incrementally.
+        """
+        pool = await self._ensure_pool()
+        now = datetime.now(timezone.utc).isoformat()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("TRUNCATE TABLE external_attack_archive, external_attack_daily")
+                log_result = await conn.execute(
+                    f"""
+                    INSERT INTO external_attack_archive
+                        (ip, first_seen, last_seen, total_packets, protocols, node_ids, updated_at)
+                    SELECT
+                        l.attacker_ip AS ip,
+                        MIN(l.timestamp) AS first_seen,
+                        MAX(l.timestamp) AS last_seen,
+                        COUNT(*)::bigint AS total_packets,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT l.protocol) FILTER (WHERE l.protocol IS NOT NULL AND l.protocol != ''),
+                            ARRAY[]::text[]
+                        ) AS protocols,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT l.node_id) FILTER (WHERE l.node_id IS NOT NULL AND l.node_id != ''),
+                            ARRAY[]::text[]
+                        ) AS node_ids,
+                        $1 AS updated_at
+                    FROM logs l
+                    WHERE l.attacker_ip IS NOT NULL
+                      AND l.attacker_ip != ''
+                      AND {self._not_private_ip_sql("l.attacker_ip")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agents ag
+                          WHERE ag.ip = l.attacker_ip
+                      )
+                    GROUP BY l.attacker_ip
+                    """,
+                    now,
+                )
+                alert_result = await conn.execute(
+                    f"""
+                    INSERT INTO external_attack_archive
+                        (ip, first_seen, last_seen, alert_count, max_severity, protocols, node_ids,
+                         signature_ids, categories, sources, updated_at)
+                    SELECT
+                        a.attacker_ip AS ip,
+                        MIN(a.timestamp) AS first_seen,
+                        MAX(a.timestamp) AS last_seen,
+                        COUNT(*)::bigint AS alert_count,
+                        COALESCE(MIN(NULLIF(a.severity, 0)), 0) AS max_severity,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT a.protocol) FILTER (WHERE a.protocol IS NOT NULL AND a.protocol != ''),
+                            ARRAY[]::text[]
+                        ) AS protocols,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT a.node_id) FILTER (WHERE a.node_id IS NOT NULL AND a.node_id != ''),
+                            ARRAY[]::text[]
+                        ) AS node_ids,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT a.signature_id) FILTER (WHERE a.signature_id IS NOT NULL),
+                            ARRAY[]::integer[]
+                        ) AS signature_ids,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT a.category) FILTER (WHERE a.category IS NOT NULL AND a.category != ''),
+                            ARRAY[]::text[]
+                        ) AS categories,
+                        COALESCE(
+                            ARRAY_AGG(DISTINCT a.source) FILTER (WHERE a.source IS NOT NULL AND a.source != ''),
+                            ARRAY[]::text[]
+                        ) AS sources,
+                        $1 AS updated_at
+                    FROM alerts a
+                    WHERE a.attacker_ip IS NOT NULL
+                      AND a.attacker_ip != ''
+                      AND {self._not_private_ip_sql("a.attacker_ip")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agents ag
+                          WHERE ag.ip = a.attacker_ip
+                      )
+                    GROUP BY a.attacker_ip
+                    ON CONFLICT (ip) DO UPDATE SET
+                        alert_count = EXCLUDED.alert_count,
+                        max_severity = EXCLUDED.max_severity,
+                        protocols = (
+                            SELECT ARRAY(
+                                SELECT DISTINCT value
+                                FROM unnest(external_attack_archive.protocols || EXCLUDED.protocols) AS value
+                                WHERE value IS NOT NULL AND value != ''
+                                ORDER BY value
+                            )
+                        ),
+                        node_ids = (
+                            SELECT ARRAY(
+                                SELECT DISTINCT value
+                                FROM unnest(external_attack_archive.node_ids || EXCLUDED.node_ids) AS value
+                                WHERE value IS NOT NULL AND value != ''
+                                ORDER BY value
+                            )
+                        ),
+                        signature_ids = EXCLUDED.signature_ids,
+                        categories = EXCLUDED.categories,
+                        sources = EXCLUDED.sources,
+                        first_seen = CASE
+                            WHEN external_attack_archive.first_seen IS NULL THEN EXCLUDED.first_seen
+                            WHEN EXCLUDED.first_seen IS NULL THEN external_attack_archive.first_seen
+                            WHEN EXCLUDED.first_seen < external_attack_archive.first_seen THEN EXCLUDED.first_seen
+                            ELSE external_attack_archive.first_seen
+                        END,
+                        last_seen = CASE
+                            WHEN external_attack_archive.last_seen IS NULL THEN EXCLUDED.last_seen
+                            WHEN EXCLUDED.last_seen IS NULL THEN external_attack_archive.last_seen
+                            WHEN EXCLUDED.last_seen > external_attack_archive.last_seen THEN EXCLUDED.last_seen
+                            ELSE external_attack_archive.last_seen
+                        END,
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    now,
+                )
+                daily_log_result = await conn.execute(
+                    f"""
+                    INSERT INTO external_attack_daily
+                        (day, ip, protocol, node_id, packet_count, first_seen, last_seen)
+                    SELECT
+                        SUBSTRING(l.timestamp FROM 1 FOR 10) AS day,
+                        l.attacker_ip AS ip,
+                        COALESCE(l.protocol, '') AS protocol,
+                        COALESCE(l.node_id, '') AS node_id,
+                        COUNT(*)::bigint AS packet_count,
+                        MIN(l.timestamp) AS first_seen,
+                        MAX(l.timestamp) AS last_seen
+                    FROM logs l
+                    WHERE l.attacker_ip IS NOT NULL
+                      AND l.attacker_ip != ''
+                      AND l.timestamp IS NOT NULL
+                      AND LENGTH(l.timestamp) >= 10
+                      AND {self._not_private_ip_sql("l.attacker_ip")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agents ag
+                          WHERE ag.ip = l.attacker_ip
+                      )
+                    GROUP BY SUBSTRING(l.timestamp FROM 1 FOR 10), l.attacker_ip, COALESCE(l.protocol, ''), COALESCE(l.node_id, '')
+                    """
+                )
+                daily_alert_result = await conn.execute(
+                    f"""
+                    INSERT INTO external_attack_daily
+                        (day, ip, protocol, node_id, alert_count, max_severity, first_seen, last_seen)
+                    SELECT
+                        SUBSTRING(a.timestamp FROM 1 FOR 10) AS day,
+                        a.attacker_ip AS ip,
+                        COALESCE(a.protocol, '') AS protocol,
+                        COALESCE(a.node_id, '') AS node_id,
+                        COUNT(*)::bigint AS alert_count,
+                        COALESCE(MIN(NULLIF(a.severity, 0)), 0) AS max_severity,
+                        MIN(a.timestamp) AS first_seen,
+                        MAX(a.timestamp) AS last_seen
+                    FROM alerts a
+                    WHERE a.attacker_ip IS NOT NULL
+                      AND a.attacker_ip != ''
+                      AND a.timestamp IS NOT NULL
+                      AND LENGTH(a.timestamp) >= 10
+                      AND {self._not_private_ip_sql("a.attacker_ip")}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM agents ag
+                          WHERE ag.ip = a.attacker_ip
+                      )
+                    GROUP BY SUBSTRING(a.timestamp FROM 1 FOR 10), a.attacker_ip, COALESCE(a.protocol, ''), COALESCE(a.node_id, '')
+                    ON CONFLICT (day, ip, protocol, node_id) DO UPDATE SET
+                        alert_count = EXCLUDED.alert_count,
+                        max_severity = EXCLUDED.max_severity,
+                        first_seen = CASE
+                            WHEN external_attack_daily.first_seen IS NULL THEN EXCLUDED.first_seen
+                            WHEN EXCLUDED.first_seen IS NULL THEN external_attack_daily.first_seen
+                            WHEN EXCLUDED.first_seen < external_attack_daily.first_seen THEN EXCLUDED.first_seen
+                            ELSE external_attack_daily.first_seen
+                        END,
+                        last_seen = CASE
+                            WHEN external_attack_daily.last_seen IS NULL THEN EXCLUDED.last_seen
+                            WHEN EXCLUDED.last_seen IS NULL THEN external_attack_daily.last_seen
+                            WHEN EXCLUDED.last_seen > external_attack_daily.last_seen THEN EXCLUDED.last_seen
+                            ELSE external_attack_daily.last_seen
+                        END
+                    """
+                )
+        return {
+            "archive_log_ips": self._deleted_count(log_result),
+            "archive_alert_ips": self._deleted_count(alert_result),
+            "daily_log_rows": self._deleted_count(daily_log_result),
+            "daily_alert_rows": self._deleted_count(daily_alert_result),
+            "updated_at": now,
+        }
