@@ -15,6 +15,9 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 PID_FILE="$SCRIPT_DIR/.agent.pid"
 LOG_FILE="$SCRIPT_DIR/agent.log"
 DAEMON_MODE=false
+AGENT_DAEMON_LOG_MODE="${AGENT_DAEMON_LOG_MODE:-errors}"
+AGENT_DAEMON_LOG_MAX_BYTES="${AGENT_DAEMON_LOG_MAX_BYTES:-10485760}"
+AGENT_DAEMON_LOG_BACKUP_COUNT="${AGENT_DAEMON_LOG_BACKUP_COUNT:-3}"
 
 # ─────────────────────────────────────────
 # 2. Color Helpers
@@ -159,6 +162,99 @@ case "${1:-}" in
         fail "Unknown command: $1. Use -h for help."
         ;;
 esac
+
+_read_client_env_value() {
+    local key="$1"
+    local value
+    value="$(grep -E "^${key}=" "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%\"}"
+    value="${value#\"}"
+    value="${value%\'}"
+    value="${value#\'}"
+    printf '%s' "$value"
+}
+
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    value="$(_read_client_env_value AGENT_DAEMON_LOG_MODE)"
+    [ -n "$value" ] && AGENT_DAEMON_LOG_MODE="$value"
+    value="$(_read_client_env_value AGENT_DAEMON_LOG_MAX_BYTES)"
+    [ -n "$value" ] && AGENT_DAEMON_LOG_MAX_BYTES="$value"
+    value="$(_read_client_env_value AGENT_DAEMON_LOG_BACKUP_COUNT)"
+    [ -n "$value" ] && AGENT_DAEMON_LOG_BACKUP_COUNT="$value"
+fi
+
+AGENT_DAEMON_LOG_MODE="${AGENT_DAEMON_LOG_MODE:-errors}"
+AGENT_DAEMON_LOG_MAX_BYTES="${AGENT_DAEMON_LOG_MAX_BYTES:-10485760}"
+AGENT_DAEMON_LOG_BACKUP_COUNT="${AGENT_DAEMON_LOG_BACKUP_COUNT:-3}"
+
+case "$AGENT_DAEMON_LOG_MODE" in
+    errors|full|off) ;;
+    *)
+        warn "Invalid AGENT_DAEMON_LOG_MODE=$AGENT_DAEMON_LOG_MODE; using errors."
+        AGENT_DAEMON_LOG_MODE="errors"
+        ;;
+esac
+
+if ! [[ "$AGENT_DAEMON_LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || [ "$AGENT_DAEMON_LOG_MAX_BYTES" -lt 1024 ]; then
+    warn "Invalid AGENT_DAEMON_LOG_MAX_BYTES=$AGENT_DAEMON_LOG_MAX_BYTES; using 10485760."
+    AGENT_DAEMON_LOG_MAX_BYTES=10485760
+fi
+
+if ! [[ "$AGENT_DAEMON_LOG_BACKUP_COUNT" =~ ^[0-9]+$ ]]; then
+    warn "Invalid AGENT_DAEMON_LOG_BACKUP_COUNT=$AGENT_DAEMON_LOG_BACKUP_COUNT; using 3."
+    AGENT_DAEMON_LOG_BACKUP_COUNT=3
+fi
+
+_prune_agent_logs() {
+    local count="$AGENT_DAEMON_LOG_BACKUP_COUNT"
+    if [ "$count" -le 0 ]; then
+        rm -f "$LOG_FILE".* 2>/dev/null || true
+        return
+    fi
+    find "$SCRIPT_DIR" -maxdepth 1 -type f -name 'agent.log.*' | while read -r path; do
+        suffix="${path##*.}"
+        if [[ "$suffix" =~ ^[0-9]+$ ]] && [ "$suffix" -gt "$count" ]; then
+            rm -f "$path" 2>/dev/null || true
+        fi
+    done
+}
+
+_rotate_agent_log_if_needed() {
+    if [ "$AGENT_DAEMON_LOG_MODE" = "off" ]; then
+        return
+    fi
+    if [ ! -f "$LOG_FILE" ]; then
+        _prune_agent_logs
+        return
+    fi
+    local size
+    size=$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)
+    if [ "$size" -lt "$AGENT_DAEMON_LOG_MAX_BYTES" ]; then
+        _prune_agent_logs
+        return
+    fi
+
+    local count="$AGENT_DAEMON_LOG_BACKUP_COUNT"
+    if [ "$count" -le 0 ]; then
+        : > "$LOG_FILE"
+        return
+    fi
+    local i
+    for ((i=count; i>=1; i--)); do
+        if [ -f "$LOG_FILE.$i" ]; then
+            if [ "$i" -eq "$count" ]; then
+                rm -f "$LOG_FILE.$i"
+            else
+                mv "$LOG_FILE.$i" "$LOG_FILE.$((i + 1))"
+            fi
+        fi
+    done
+    mv "$LOG_FILE" "$LOG_FILE.1"
+    ok "Rotated oversized agent.log."
+    _prune_agent_logs
+}
 
 if _agent_running; then
     fail "Agent is already running (PID $(cat "$PID_FILE")). Run '$0 stop' first."
@@ -338,6 +434,7 @@ fi
 # 8. Create Runtime Directories
 # ─────────────────────────────────────────
 mkdir -p "$SCRIPT_DIR/runtime"
+_rotate_agent_log_if_needed
 
 # ─────────────────────────────────────────
 # 9. Validate Config Before Starting
@@ -383,11 +480,17 @@ echo -e "  Server:     ${CYAN}${SERVER_URL}${NC}"
 
 if [ "$DAEMON_MODE" = true ]; then
     echo -e "  Mode:       ${CYAN}Background (daemon)${NC}"
-    echo -e "  Log:        ${CYAN}${LOG_FILE}${NC}"
+    echo -e "  Log:        ${CYAN}${LOG_FILE}${NC} (${AGENT_DAEMON_LOG_MODE})"
     echo -e "  Stop:       ${CYAN}$0 stop${NC}"
     echo -e "${GREEN}==========================================${NC}"
     echo ""
-    nohup python3 main.py >> "$LOG_FILE" 2>&1 &
+    if [ "$AGENT_DAEMON_LOG_MODE" = "full" ]; then
+        nohup python3 main.py >> "$LOG_FILE" 2>&1 &
+    elif [ "$AGENT_DAEMON_LOG_MODE" = "off" ]; then
+        nohup python3 main.py > /dev/null 2>&1 &
+    else
+        nohup python3 main.py > /dev/null 2>> "$LOG_FILE" &
+    fi
     echo $! > "$PID_FILE"
     ok "Agent started in background (PID $!)"
     ok "View logs: $0 logs"

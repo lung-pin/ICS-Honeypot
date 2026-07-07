@@ -236,6 +236,9 @@ cp client/.env.example client/.env
 ```env
 API_KEY=shared-agent-key
 DROP_PRIVATE_IP_LOGS=true
+AGENT_DAEMON_LOG_MODE=errors
+AGENT_DAEMON_LOG_MAX_BYTES=10485760
+AGENT_DAEMON_LOG_BACKUP_COUNT=3
 ```
 
 確認 `client/client_config.json` 內的 `node_id` 與 `server_url`：
@@ -250,6 +253,7 @@ DROP_PRIVATE_IP_LOGS=true
 
 若 Agent 與 Server 位於不同主機，請將 `server_url` 改成 Server 的實際 IP 或網域。如果 `server/.env` 使用自訂 `SERVER_PORT`，這裡的 `server_url` 也要使用相同 port。
 `DROP_PRIVATE_IP_LOGS=true` 會讓 Agent 在寫入 proxy JSONL 與本地 SQLite 前丟棄 `127.0.0.1`、`172.16.0.0/12`、`192.168.0.0/16`、`10.0.0.0/8` 等內部 IP 流量。
+`AGENT_DAEMON_LOG_MODE=errors` 會讓背景模式只把 stderr/error traceback 寫入 `agent.log`；如需完整 stdout/stderr 可改為 `full`，完全不寫可改為 `off`。`AGENT_DAEMON_LOG_MAX_BYTES` 與 `AGENT_DAEMON_LOG_BACKUP_COUNT` 控制 `agent.log` 大小輪替。
 
 ### 5. 啟動 Server 與分析服務
 

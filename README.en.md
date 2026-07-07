@@ -181,6 +181,9 @@ Then make sure `client/.env` uses the same `API_KEY` as the Server:
 ```env
 API_KEY=shared-agent-key
 DROP_PRIVATE_IP_LOGS=true
+AGENT_DAEMON_LOG_MODE=errors
+AGENT_DAEMON_LOG_MAX_BYTES=10485760
+AGENT_DAEMON_LOG_BACKUP_COUNT=3
 ```
 
 Check `client/client_config.json` for `node_id` and `server_url`:
@@ -195,6 +198,7 @@ Check `client/client_config.json` for `node_id` and `server_url`:
 
 If the Agent and Server are on different machines, change `server_url` to the Server's actual IP address or domain. If `server/.env` uses a custom `SERVER_PORT`, this `server_url` must use the same port.
 `DROP_PRIVATE_IP_LOGS=true` makes the Agent discard internal IP traffic such as `127.0.0.1`, `172.16.0.0/12`, `192.168.0.0/16`, and `10.0.0.0/8` before writing proxy JSONL or local SQLite logs.
+`AGENT_DAEMON_LOG_MODE=errors` makes daemon mode write only stderr/error tracebacks to `agent.log`; use `full` for stdout+stderr or `off` to disable agent log output. `AGENT_DAEMON_LOG_MAX_BYTES` and `AGENT_DAEMON_LOG_BACKUP_COUNT` control `agent.log` rotation.
 
 ### 5. Start the Server and Analysis Services
 
