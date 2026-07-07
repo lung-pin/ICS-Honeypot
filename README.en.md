@@ -160,11 +160,13 @@ SERVER_DAEMON_LOG_MODE=errors
 SERVER_DAEMON_LOG_MAX_BYTES=10485760
 SERVER_DAEMON_LOG_BACKUP_COUNT=3
 SERVER_UVICORN_LOG_LEVEL=warning
+DROP_PRIVATE_IP_LOGS=true
 ```
 
 `API_KEY` must match the Client Agent configuration so Agents can fetch deployment settings and upload logs. To deploy the Server on a custom port, change `SERVER_PORT` and make `SERVER_PUBLIC_URL` use the same port.
 The Server automatically deletes old data according to `.env`: `SERVER_LOG_RETENTION_DAYS` controls PostgreSQL logs and alerts, `SERVER_JSON_LOG_RETENTION_DAYS` controls `server/logs/*.json`, and `SERVER_DAEMON_LOG_RETENTION_DAYS` controls rotated `server.log.*` files.
 `SERVER_DAEMON_LOG_MODE=errors` makes daemon mode write only stderr/error tracebacks to `server.log`; use `full` for stdout+stderr or `off` to disable daemon log output. `SERVER_DAEMON_LOG_MAX_BYTES` and `SERVER_DAEMON_LOG_BACKUP_COUNT` control `server.log` rotation.
+`DROP_PRIVATE_IP_LOGS=true` makes the Server discard loopback, RFC1918, and Docker bridge traffic before storing logs, preventing internal service traffic from filling PostgreSQL and ELK JSON logs.
 
 ### 4. Configure Client Agent Environment Variables
 
@@ -178,6 +180,7 @@ Then make sure `client/.env` uses the same `API_KEY` as the Server:
 
 ```env
 API_KEY=shared-agent-key
+DROP_PRIVATE_IP_LOGS=true
 ```
 
 Check `client/client_config.json` for `node_id` and `server_url`:
@@ -191,6 +194,7 @@ Check `client/client_config.json` for `node_id` and `server_url`:
 ```
 
 If the Agent and Server are on different machines, change `server_url` to the Server's actual IP address or domain. If `server/.env` uses a custom `SERVER_PORT`, this `server_url` must use the same port.
+`DROP_PRIVATE_IP_LOGS=true` makes the Agent discard internal IP traffic such as `127.0.0.1`, `172.16.0.0/12`, `192.168.0.0/16`, and `10.0.0.0/8` before writing proxy JSONL or local SQLite logs.
 
 ### 5. Start the Server and Analysis Services
 

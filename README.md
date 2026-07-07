@@ -215,11 +215,13 @@ SERVER_DAEMON_LOG_MODE=errors
 SERVER_DAEMON_LOG_MAX_BYTES=10485760
 SERVER_DAEMON_LOG_BACKUP_COUNT=3
 SERVER_UVICORN_LOG_LEVEL=warning
+DROP_PRIVATE_IP_LOGS=true
 ```
 
 `API_KEY` 必須與 Client Agent 的設定一致，Agent 才能向 Server 取得部署設定並回傳日誌。若部署時要改 Server port，修改 `SERVER_PORT`，並讓 `SERVER_PUBLIC_URL` 使用相同 port。
 Server 會依 `.env` 的保留天數自動清除舊資料：`SERVER_LOG_RETENTION_DAYS` 控制 PostgreSQL 日誌與告警，`SERVER_JSON_LOG_RETENTION_DAYS` 控制 `server/logs/*.json`，`SERVER_DAEMON_LOG_RETENTION_DAYS` 控制輪替後的 `server.log.*`。
 `SERVER_DAEMON_LOG_MODE=errors` 會讓背景模式只把 stderr/error traceback 寫入 `server.log`；如需完整 stdout/stderr 可改為 `full`，完全不寫可改為 `off`。`SERVER_DAEMON_LOG_MAX_BYTES` 與 `SERVER_DAEMON_LOG_BACKUP_COUNT` 控制 `server.log` 大小輪替。
+`DROP_PRIVATE_IP_LOGS=true` 會讓 Server 入庫前丟棄 loopback、RFC1918、Docker bridge 等內部 IP 流量，避免內部服務互傳佔滿 PostgreSQL 與 ELK JSON log。
 
 ### 4. 設定 Client Agent 環境變數
 
@@ -233,6 +235,7 @@ cp client/.env.example client/.env
 
 ```env
 API_KEY=shared-agent-key
+DROP_PRIVATE_IP_LOGS=true
 ```
 
 確認 `client/client_config.json` 內的 `node_id` 與 `server_url`：
@@ -246,6 +249,7 @@ API_KEY=shared-agent-key
 ```
 
 若 Agent 與 Server 位於不同主機，請將 `server_url` 改成 Server 的實際 IP 或網域。如果 `server/.env` 使用自訂 `SERVER_PORT`，這裡的 `server_url` 也要使用相同 port。
+`DROP_PRIVATE_IP_LOGS=true` 會讓 Agent 在寫入 proxy JSONL 與本地 SQLite 前丟棄 `127.0.0.1`、`172.16.0.0/12`、`192.168.0.0/16`、`10.0.0.0/8` 等內部 IP 流量。
 
 ### 5. 啟動 Server 與分析服務
 

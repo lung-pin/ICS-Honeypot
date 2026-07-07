@@ -9,6 +9,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Tuple
+from ip_filter import drop_private_ip_logs_enabled, is_internal_ip
 from .unified_logger import UnifiedLogger, LogEntry, NetworkInfo, ProtocolInfo, RequestData, ResponseData, SessionInfo
 
 
@@ -70,6 +71,7 @@ class BaseProxy(ABC):
         self.whitelist_logger = whitelist_logger
         # WhitelistManager-like object; must expose .is_whitelisted(ip) -> bool.
         self.whitelist = whitelist
+        self.drop_private_ip_logs = drop_private_ip_logs_enabled()
 
         self._running = False
         self._server_socket: Optional[socket.socket] = None
@@ -375,6 +377,9 @@ class BaseProxy(ABC):
         import base64
 
         src_ip = client_addr[0]
+        if self.drop_private_ip_logs and is_internal_ip(src_ip):
+            return
+
         is_whitelisted = bool(self.whitelist and self.whitelist.is_whitelisted(src_ip))
 
         entry = LogEntry(

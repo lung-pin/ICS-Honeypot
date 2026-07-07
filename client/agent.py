@@ -15,6 +15,7 @@ from docker_manager import DockerDeploymentManager
 from log_collector import ContainerLogCollector
 from proxy.proxy_manager import ProxyManager, normalize_deployment_proxies
 from whitelist import WhitelistManager
+from ip_filter import drop_private_ip_logs_enabled, is_internal_ip
 
 
 def _get_local_ip():
@@ -79,6 +80,7 @@ class NodeAgent:
         self.collect_max_lines_per_file = int(os.environ.get("AGENT_COLLECT_MAX_LINES_PER_FILE", "5000"))
         self.log_retention_days = int(os.environ.get("CLIENT_LOG_RETENTION_DAYS", "30"))
         self.log_cleanup_interval = int(os.environ.get("CLIENT_LOG_CLEANUP_INTERVAL_SECONDS", "3600"))
+        self.drop_private_ip_logs = drop_private_ip_logs_enabled()
         self._last_log_cleanup_time = 0
 
     def start(self):
@@ -453,6 +455,12 @@ class NodeAgent:
                     }
 
                     src_ip = entry.get("network", {}).get("src_ip", "unknown")
+                    lines_processed += 1
+                    if self.drop_private_ip_logs and is_internal_ip(src_ip):
+                        if lines_processed >= self.collect_max_lines_per_file:
+                            break
+                        continue
+
                     metadata["log.message"] = self._build_proxy_log_message(
                         protocol_name, req_parsed, resp_parsed, src_ip
                     )
@@ -473,7 +481,6 @@ class NodeAgent:
                         metadata=metadata,
                         timestamp=entry.get("timestamp"),
                     )
-                    lines_processed += 1
                     if lines_processed >= self.collect_max_lines_per_file:
                         break
 

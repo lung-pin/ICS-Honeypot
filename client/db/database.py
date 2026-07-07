@@ -3,10 +3,12 @@ import json
 import threading
 from datetime import datetime, timedelta
 import os
+from ip_filter import drop_private_ip_logs_enabled, is_internal_ip
 
 class LogDB:
     def __init__(self, db_path="client_logs.db"):
         self.db_path = db_path
+        self.drop_private_ip_logs = drop_private_ip_logs_enabled()
         self._lock = threading.Lock()
         self._init_db()
 
@@ -63,6 +65,8 @@ class LogDB:
                 conn.close()
 
     def log_interaction(self, attacker_ip, protocol, request_data, response_data, metadata=None, timestamp=None):
+        if self.drop_private_ip_logs and is_internal_ip(attacker_ip):
+            return
         with self._lock:
             conn = None
             try:
@@ -157,6 +161,12 @@ class LogDB:
                 deleted_logs = cursor.rowcount if cursor.rowcount is not None else 0
                 cursor.execute('DELETE FROM whitelist_logs WHERE timestamp < ?', (cutoff,))
                 deleted_whitelist_logs = cursor.rowcount if cursor.rowcount is not None else 0
+                if self.drop_private_ip_logs:
+                    private_where = self._private_ip_where_sql()
+                    cursor.execute(f'DELETE FROM logs WHERE {private_where}')
+                    deleted_logs += cursor.rowcount if cursor.rowcount is not None else 0
+                    cursor.execute(f'DELETE FROM whitelist_logs WHERE {private_where}')
+                    deleted_whitelist_logs += cursor.rowcount if cursor.rowcount is not None else 0
                 conn.commit()
                 total = deleted_logs + deleted_whitelist_logs
                 if total:
@@ -176,10 +186,29 @@ class LogDB:
                 if conn:
                     conn.close()
 
+    @staticmethod
+    def _private_ip_where_sql(column="attacker_ip"):
+        return (
+            f"{column} LIKE '0.%' OR "
+            f"{column} LIKE '10.%' OR "
+            f"{column} LIKE '127.%' OR "
+            f"{column} LIKE '169.254.%' OR "
+            f"{column} LIKE '192.168.%' OR "
+            f"{column} = '::1' OR "
+            f"lower({column}) LIKE 'fc%' OR "
+            f"lower({column}) LIKE 'fd%' OR "
+            f"lower({column}) LIKE 'fe80%' OR "
+            f"{column} GLOB '172.1[6-9].*' OR "
+            f"{column} GLOB '172.2[0-9].*' OR "
+            f"{column} GLOB '172.3[0-1].*'"
+        )
+
     # ---------- Whitelist log methods ----------
 
     def log_whitelist_interaction(self, attacker_ip, protocol, request_data, response_data, metadata=None, timestamp=None):
         """Insert a whitelist (friendly) interaction — kept separate from attack logs."""
+        if self.drop_private_ip_logs and is_internal_ip(attacker_ip):
+            return
         with self._lock:
             conn = None
             try:

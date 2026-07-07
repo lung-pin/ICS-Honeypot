@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -10,11 +11,45 @@ def _is_unique_violation(exc):
     return exc.__class__.__name__ == "UniqueViolationError"
 
 
+_INTERNAL_IP_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    )
+)
+
+
+def _env_flag(name, default=True):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_internal_ip(ip):
+    if not ip:
+        return False
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return False
+    return any(addr in network for network in _INTERNAL_IP_NETWORKS)
+
+
 class PostgresServerDB:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._pool = None
         self._init_lock = asyncio.Lock()
+        self.drop_private_ip_logs = _env_flag("DROP_PRIVATE_IP_LOGS", True)
         try:
             self.agent_offline_after_seconds = int(os.environ.get("AGENT_OFFLINE_AFTER_SECONDS", "300"))
         except ValueError:
@@ -505,6 +540,8 @@ class PostgresServerDB:
         for log in logs:
             timestamp = log.get("timestamp") or datetime.now().isoformat()
             attacker_ip = log.get("attacker_ip")
+            if self.drop_private_ip_logs and _is_internal_ip(attacker_ip):
+                continue
             protocol = log.get("protocol")
             req = log.get("request_data")
             resp = log.get("response_data")
@@ -537,20 +574,25 @@ class PostgresServerDB:
         return len(rows)
 
     @staticmethod
-    def _not_private_ip_sql(column: str) -> str:
+    def _private_ip_sql(column: str) -> str:
         return (
-            "NOT ("
+            "("
+            f"{column} LIKE '0.%' OR "
             f"{column} LIKE '10.%' OR "
             f"{column} LIKE '127.%' OR "
             f"{column} LIKE '169.254.%' OR "
             f"{column} LIKE '192.168.%' OR "
-            f"{column} LIKE '0.%' OR "
             f"{column} = '::1' OR "
             f"{column} ILIKE 'fc%' OR "
             f"{column} ILIKE 'fd%' OR "
+            f"{column} ILIKE 'fe80%' OR "
             f"{column} ~ '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.'"
             ")"
         )
+
+    @staticmethod
+    def _not_private_ip_sql(column: str) -> str:
+        return f"NOT {PostgresServerDB._private_ip_sql(column)}"
 
     async def get_recent_logs(self, limit=100, exclude_ips=None, hide_private_ips=False):
         pool = await self._ensure_pool()
@@ -803,6 +845,39 @@ class PostgresServerDB:
                 deleted_alerts = self._deleted_count(
                     await conn.execute("DELETE FROM alerts WHERE timestamp < $1", cutoff)
                 )
+                if self.drop_private_ip_logs:
+                    private_ip_filter = self._private_ip_sql("attacker_ip")
+                    await conn.execute(
+                        f"""
+                        INSERT INTO cleanup_ips (ip)
+                        SELECT DISTINCT attacker_ip
+                        FROM logs
+                        WHERE {private_ip_filter}
+                          AND attacker_ip IS NOT NULL
+                          AND attacker_ip != ''
+                        ON CONFLICT DO NOTHING
+                        """
+                    )
+                    await conn.execute(
+                        f"""
+                        INSERT INTO cleanup_ips (ip)
+                        SELECT DISTINCT attacker_ip
+                        FROM alerts
+                        WHERE {private_ip_filter}
+                          AND attacker_ip IS NOT NULL
+                          AND attacker_ip != ''
+                        ON CONFLICT DO NOTHING
+                        """
+                    )
+                    deleted_logs += self._deleted_count(
+                        await conn.execute(f"DELETE FROM logs WHERE {private_ip_filter}")
+                    )
+                    deleted_whitelist_logs += self._deleted_count(
+                        await conn.execute(f"DELETE FROM whitelist_logs WHERE {private_ip_filter}")
+                    )
+                    deleted_alerts += self._deleted_count(
+                        await conn.execute(f"DELETE FROM alerts WHERE {private_ip_filter}")
+                    )
                 if deleted_logs or deleted_alerts:
                     await self._refresh_cleanup_ip_summaries(conn)
         return {
@@ -823,6 +898,9 @@ class PostgresServerDB:
         rows = []
         for log in logs:
             timestamp = log.get("timestamp") or datetime.now().isoformat()
+            attacker_ip = log.get("attacker_ip")
+            if self.drop_private_ip_logs and _is_internal_ip(attacker_ip):
+                continue
             req = log.get("request_data")
             resp = log.get("response_data")
             meta_dict = self._parse_metadata(log.get("metadata"))
@@ -834,7 +912,7 @@ class PostgresServerDB:
                 timestamp,
                 node_id,
                 log.get("protocol"),
-                log.get("attacker_ip"),
+                attacker_ip,
                 req,
                 resp,
                 json.dumps(meta_dict, ensure_ascii=False),
