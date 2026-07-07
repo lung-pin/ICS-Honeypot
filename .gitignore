@@ -27,6 +27,17 @@ pip-delete-this-directory.txt
 # ============================
 # CRITICAL: Never commit .env files — they contain API keys & passwords
 .env
+.env.*
+!.env.example
+!**/.env.example
+
+# TLS certificates / private keys
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
 
 # ============================
 # Databases
@@ -34,7 +45,13 @@ pip-delete-this-directory.txt
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
+*.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 
 # ============================
 # Client Runtime & Generated Data
@@ -79,6 +96,12 @@ logs/
 # ============================
 server/elk/es_data/
 server/elk/filebeat_data/
+server/elk/pg_data/
+server/elk/elastalert_rendered/
+
+# Docker Compose local overrides
+docker-compose.override.yml
+**/docker-compose.override.yml
 
 # ============================
 # OS Files
@@ -108,7 +131,32 @@ Desktop.ini
 htmlcov/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.tox/
+.hypothesis/
 test_*.html
+
+# Generated packages / archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# Packet captures / exported traffic logs
+*.pcap
+*.pcapng
+*.har
+*.jsonl
+*.ndjson
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
 
 # ============================
 # Project-local / Personal
@@ -121,4 +169,3 @@ tools/
 
 # AI assistant local settings (CLAUDE.md is tracked as project docs)
 .claude/
-CLAUDE.md

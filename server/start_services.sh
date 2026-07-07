@@ -15,7 +15,13 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 PID_FILE="$SCRIPT_DIR/.server.pid"
 LOG_FILE="$SCRIPT_DIR/server.log"
 DAEMON_MODE=false
+API_ONLY_MODE=false
+SKIP_ELK=false
 SERVER_PORT=8000
+SERVER_DAEMON_LOG_MODE=errors
+SERVER_DAEMON_LOG_MAX_BYTES=10485760
+SERVER_DAEMON_LOG_BACKUP_COUNT=3
+SERVER_DAEMON_LOG_RETENTION_DAYS=30
 
 # ─────────────────────────────────────────
 # 2. Color Helpers
@@ -36,16 +42,70 @@ _validate_port() {
     [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
+_validate_nonnegative_int() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+_is_truthy() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 _load_server_env_config() {
     local configured_port=""
+    local configured_api_only=""
+    local configured_disable_elk=""
+    local configured_log_mode=""
+    local configured_log_max_bytes=""
+    local configured_log_backup_count=""
+    local configured_log_retention_days=""
     if [ -f "$SCRIPT_DIR/.env" ]; then
         configured_port=$(grep -E "^SERVER_PORT=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_api_only=$(grep -E "^SERVER_API_ONLY=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_disable_elk=$(grep -E "^SERVER_DISABLE_ELK=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_log_mode=$(grep -E "^SERVER_DAEMON_LOG_MODE=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_log_max_bytes=$(grep -E "^SERVER_DAEMON_LOG_MAX_BYTES=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_log_backup_count=$(grep -E "^SERVER_DAEMON_LOG_BACKUP_COUNT=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_log_retention_days=$(grep -E "^SERVER_DAEMON_LOG_RETENTION_DAYS=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
     fi
     configured_port="${configured_port:-8000}"
     if ! _validate_port "$configured_port"; then
         fail "Invalid SERVER_PORT=$configured_port in server/.env. Use a number from 1 to 65535."
     fi
     SERVER_PORT="$configured_port"
+    if _is_truthy "$configured_api_only"; then
+        API_ONLY_MODE=true
+    fi
+    if _is_truthy "$configured_disable_elk"; then
+        SKIP_ELK=true
+    fi
+    configured_log_mode="${configured_log_mode:-errors}"
+    configured_log_mode="$(printf '%s' "$configured_log_mode" | tr '[:upper:]' '[:lower:]')"
+    case "$configured_log_mode" in
+        full|errors|off) SERVER_DAEMON_LOG_MODE="$configured_log_mode" ;;
+        *) warn "Invalid SERVER_DAEMON_LOG_MODE=$configured_log_mode; using errors."; SERVER_DAEMON_LOG_MODE=errors ;;
+    esac
+    configured_log_max_bytes="${configured_log_max_bytes:-10485760}"
+    if _validate_nonnegative_int "$configured_log_max_bytes"; then
+        SERVER_DAEMON_LOG_MAX_BYTES="$configured_log_max_bytes"
+    else
+        warn "Invalid SERVER_DAEMON_LOG_MAX_BYTES=$configured_log_max_bytes; using 10485760."
+    fi
+    configured_log_backup_count="${configured_log_backup_count:-3}"
+    if _validate_nonnegative_int "$configured_log_backup_count"; then
+        SERVER_DAEMON_LOG_BACKUP_COUNT="$configured_log_backup_count"
+    else
+        warn "Invalid SERVER_DAEMON_LOG_BACKUP_COUNT=$configured_log_backup_count; using 3."
+    fi
+    configured_log_retention_days="${configured_log_retention_days:-30}"
+    if _validate_nonnegative_int "$configured_log_retention_days"; then
+        SERVER_DAEMON_LOG_RETENTION_DAYS="$configured_log_retention_days"
+    else
+        warn "Invalid SERVER_DAEMON_LOG_RETENTION_DAYS=$configured_log_retention_days; using 30."
+    fi
 }
 
 _load_server_env_config
@@ -145,7 +205,51 @@ _stop_elk() {
     (cd "$elk_dir" && (docker compose stop 2>/dev/null || docker-compose stop 2>/dev/null)) || true
 }
 
-case "${1:-}" in
+print_usage() {
+    echo "Usage: $0 [options] | stop | status | logs"
+    echo ""
+    echo "Options:"
+    echo "  (no args)             Start in foreground"
+    echo "  -d, --daemon          Start in background"
+    echo "  --api-only, --no-web  Start API only; disable Web UI/static pages"
+    echo "  --no-elk, --skip-elk  Start PostgreSQL only; skip Elasticsearch/Kibana/Filebeat/ElastAlert"
+    echo ""
+    echo "Commands:"
+    echo "  stop                  Stop background server and Docker services"
+    echo "  status                Check if server is running"
+    echo "  logs                  Tail server log file"
+}
+
+COMMAND="start"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        stop|status|logs)
+            if [ "$COMMAND" != "start" ]; then
+                fail "Only one command can be used at a time."
+            fi
+            COMMAND="$1"
+            ;;
+        -d|--daemon)
+            DAEMON_MODE=true
+            ;;
+        --api-only|--no-web)
+            API_ONLY_MODE=true
+            ;;
+        --no-elk|--skip-elk)
+            SKIP_ELK=true
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            fail "Unknown command or option: $1. Use -h for help."
+            ;;
+    esac
+    shift
+done
+
+case "$COMMAND" in
     stop)
         STOPPED_ANY=false
         # 1. Try PID file first
@@ -200,23 +304,10 @@ case "${1:-}" in
         fi
         exit 0
         ;;
-    -d|--daemon)
-        DAEMON_MODE=true
-        ;;
-    -h|--help)
-        echo "Usage: $0 [-d|--daemon] | stop | status | logs"
-        echo ""
-        echo "  (no args)    Start in foreground"
-        echo "  -d, --daemon Start in background"
-        echo "  stop         Stop background server"
-        echo "  status       Check if server is running"
-        echo "  logs         Tail server log file"
-        exit 0
-        ;;
-    "")
+    start)
         ;; # foreground mode, default
     *)
-        fail "Unknown command: $1. Use -h for help."
+        fail "Unknown command: $COMMAND. Use -h for help."
         ;;
 esac
 
@@ -229,7 +320,7 @@ fi
 # ─────────────────────────────────────────
 cleanup() {
     echo ""
-    info "Stopping ELK services..."
+    info "Stopping Docker services..."
     if [ -d "$SCRIPT_DIR/elk" ]; then
         cd "$SCRIPT_DIR/elk" || true
         docker compose stop 2>/dev/null || docker-compose stop 2>/dev/null || true
@@ -456,6 +547,11 @@ SESSION_SECRET=${SESSION_SECRET}
 
 # FastAPI listen port
 SERVER_PORT=8000
+SERVER_API_ONLY=0
+SERVER_DISABLE_ELK=0
+SERVER_DAEMON_LOG_MODE=errors
+SERVER_DAEMON_LOG_MAX_BYTES=10485760
+SERVER_DAEMON_LOG_BACKUP_COUNT=3
 
 # Server Public URL (set to EC2 public IP for remote deployment)
 # Leave empty for auto-detect from request headers.
@@ -484,6 +580,36 @@ EOF
 SERVER_PORT=8000
 EOF
             ok "Added SERVER_PORT default to server/.env."
+        fi
+        if ! grep -qE "^SERVER_API_ONLY=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+SERVER_API_ONLY=0
+EOF
+            ok "Added SERVER_API_ONLY default to server/.env."
+        fi
+        if ! grep -qE "^SERVER_DISABLE_ELK=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+SERVER_DISABLE_ELK=0
+EOF
+            ok "Added SERVER_DISABLE_ELK default to server/.env."
+        fi
+        if ! grep -qE "^SERVER_DAEMON_LOG_MODE=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+SERVER_DAEMON_LOG_MODE=errors
+EOF
+            ok "Added SERVER_DAEMON_LOG_MODE default to server/.env."
+        fi
+        if ! grep -qE "^SERVER_DAEMON_LOG_MAX_BYTES=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+SERVER_DAEMON_LOG_MAX_BYTES=10485760
+EOF
+            ok "Added SERVER_DAEMON_LOG_MAX_BYTES default to server/.env."
+        fi
+        if ! grep -qE "^SERVER_DAEMON_LOG_BACKUP_COUNT=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+SERVER_DAEMON_LOG_BACKUP_COUNT=3
+EOF
+            ok "Added SERVER_DAEMON_LOG_BACKUP_COUNT default to server/.env."
         fi
         if ! grep -qE "^DATABASE_URL=" "$SCRIPT_DIR/.env"; then
             cat >> "$SCRIPT_DIR/.env" <<'EOF'
@@ -579,20 +705,45 @@ if [ -d "$SCRIPT_DIR/logs" ]; then
     chmod -R u+rwX,g+rX "$SCRIPT_DIR/logs" 2>/dev/null || true
 fi
 
-# Keep the daemon log from growing forever. Uvicorn access logs are disabled
-# in main.py, but existing deployments may already have large files.
-if [ -f "$LOG_FILE" ]; then
-    LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
-    if [ "$LOG_SIZE" -gt $((100 * 1024 * 1024)) ]; then
-        mv "$LOG_FILE" "$LOG_FILE.$(date +%Y%m%d%H%M%S)"
-        ok "Rotated oversized server.log."
+_prune_daemon_logs() {
+    if [ "$SERVER_DAEMON_LOG_RETENTION_DAYS" -gt 0 ]; then
+        find "$SCRIPT_DIR" -maxdepth 1 -type f -name 'server.log.*' -mtime +"$SERVER_DAEMON_LOG_RETENTION_DAYS" -exec rm -f {} \; 2>/dev/null || true
     fi
-fi
+    if [ "$SERVER_DAEMON_LOG_BACKUP_COUNT" -ge 0 ]; then
+        local keep_from=$((SERVER_DAEMON_LOG_BACKUP_COUNT + 1))
+        ls -1t "$LOG_FILE".* 2>/dev/null \
+            | tail -n +"$keep_from" \
+            | while IFS= read -r old_log; do
+                [ -n "$old_log" ] && rm -f "$old_log"
+              done || true
+    fi
+}
+
+_rotate_daemon_log_if_needed() {
+    if [ "$SERVER_DAEMON_LOG_MAX_BYTES" -le 0 ]; then
+        _prune_daemon_logs
+        return
+    fi
+    if [ -f "$LOG_FILE" ]; then
+        LOG_SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "$LOG_SIZE" -gt "$SERVER_DAEMON_LOG_MAX_BYTES" ]; then
+            mv "$LOG_FILE" "$LOG_FILE.$(date +%Y%m%d%H%M%S)"
+            ok "Rotated oversized server.log."
+        fi
+    fi
+    _prune_daemon_logs
+}
+
+_rotate_daemon_log_if_needed
 
 # ─────────────────────────────────────────
-# 11. Start ELK Stack
+# 11. Start PostgreSQL / ELK Stack
 # ─────────────────────────────────────────
-info "Starting ELK Stack (Docker)..."
+if [ "$SKIP_ELK" = true ]; then
+    info "Starting PostgreSQL only (ELK disabled)..."
+else
+    info "Starting PostgreSQL and ELK Stack (Docker)..."
+fi
 
 if [ -d "$SCRIPT_DIR/elk" ]; then
     ELK_DIR="$SCRIPT_DIR/elk"
@@ -619,6 +770,7 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
     # shellcheck disable=SC1090
     . "$SCRIPT_DIR/.env"
     set +a
+    _load_server_env_config
     SERVER_PORT="${SERVER_PORT:-8000}"
     if ! _validate_port "$SERVER_PORT"; then
         fail "Invalid SERVER_PORT=$SERVER_PORT in server/.env. Use a number from 1 to 65535."
@@ -630,18 +782,31 @@ else
     warn "$SCRIPT_DIR/.env not found — ElastAlert webhook may post without an API key."
 fi
 
-$COMPOSE_CMD up -d --force-recreate
-
-if [ $? -ne 0 ]; then
-    fail "Failed to start ELK stack. Ensure Docker is running."
+if [ "$SKIP_ELK" = true ]; then
+    if ! $COMPOSE_CMD up -d postgres; then
+        fail "Failed to start PostgreSQL. Ensure Docker is running."
+    fi
+    $COMPOSE_CMD stop elasticsearch kibana filebeat elastalert >/dev/null 2>&1 || true
+    ok "PostgreSQL started. ELK services skipped."
+else
+    if ! $COMPOSE_CMD up -d --force-recreate; then
+        fail "Failed to start PostgreSQL/ELK stack. Ensure Docker is running."
+    fi
+    ok "PostgreSQL and ELK Stack started (Elasticsearch, Kibana, Filebeat, ElastAlert)."
 fi
-
-ok "ELK Stack started (Elasticsearch, Kibana, Filebeat, ElastAlert)."
 
 # ─────────────────────────────────────────
 # 12. Start Python Server
 # ─────────────────────────────────────────
 cd "$SCRIPT_DIR" || exit
+
+# Export runtime feature flags for FastAPI.
+if [ "$API_ONLY_MODE" = true ]; then
+    export SERVER_API_ONLY=1
+fi
+if [ "$SKIP_ELK" = true ]; then
+    export SERVER_DISABLE_ELK=1
+fi
 
 # Detect public URL for display
 SERVER_URL="http://localhost:${SERVER_PORT}"
@@ -661,16 +826,35 @@ echo ""
 echo -e "${GREEN}==========================================${NC}"
 echo -e "${GREEN}  APS Honeypot Server                    ${NC}"
 echo -e "${GREEN}==========================================${NC}"
-echo -e "  Dashboard: ${CYAN}${SERVER_URL}${NC}"
-echo -e "  Kibana:    ${CYAN}${KIBANA_URL}${NC}"
+if [ "$API_ONLY_MODE" = true ]; then
+    echo -e "  API:       ${CYAN}${SERVER_URL}/api/server_info${NC}"
+    echo -e "  Web UI:    ${YELLOW}disabled${NC}"
+else
+    echo -e "  Dashboard: ${CYAN}${SERVER_URL}${NC}"
+fi
+if [ "$SKIP_ELK" = true ]; then
+    echo -e "  ELK:       ${YELLOW}disabled${NC}"
+else
+    echo -e "  Kibana:    ${CYAN}${KIBANA_URL}${NC}"
+fi
 
 if [ "$DAEMON_MODE" = true ]; then
     echo -e "  Mode:      ${CYAN}Background (daemon)${NC}"
-    echo -e "  Log:       ${CYAN}${LOG_FILE}${NC}"
+    echo -e "  Log:       ${CYAN}${LOG_FILE}${NC} (${SERVER_DAEMON_LOG_MODE})"
     echo -e "  Stop:      ${CYAN}$0 stop${NC}"
     echo -e "${GREEN}==========================================${NC}"
     echo ""
-    setsid -f "$PYTHON_BIN" main.py >> "$LOG_FILE" 2>&1 < /dev/null
+    case "$SERVER_DAEMON_LOG_MODE" in
+        full)
+            setsid -f "$PYTHON_BIN" main.py >> "$LOG_FILE" 2>&1 < /dev/null
+            ;;
+        off)
+            setsid -f "$PYTHON_BIN" main.py > /dev/null 2>&1 < /dev/null
+            ;;
+        errors|*)
+            setsid -f "$PYTHON_BIN" main.py > /dev/null 2>> "$LOG_FILE" < /dev/null
+            ;;
+    esac
     sleep 1
     NEW_PID=$(pgrep -f "$PYTHON_BIN main.py" | tail -1)
     echo "$NEW_PID" > "$PID_FILE"

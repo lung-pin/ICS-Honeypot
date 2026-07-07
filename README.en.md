@@ -72,7 +72,8 @@ Filebeat -> Elasticsearch -> Kibana -> ElastAlert
 | Honeypot Agent | Runs on each honeypot node, receives Server configuration, starts Docker services, and uploads status and attack logs. |
 | Proxy Layer | Intercepts and forwards MQTT, HTTP, TCP, Modbus, and other protocol traffic while producing structured attack events. |
 | Docker Services | Runs honeypot services such as simulated PLC, HMI, streetlight controller, or custom services. |
-| PostgreSQL / SQLite | The Server stores logs in PostgreSQL; each Agent uses SQLite as a local buffer. |
+| PostgreSQL | The Server uses PostgreSQL as the only central database for Agents, logs, alerts, and analysis summaries. |
+| Agent SQLite Buffer | Each Agent uses SQLite as a local short-term buffer before uploading data to the Server. |
 | ELK / ElastAlert | Filebeat, Elasticsearch, Kibana, and ElastAlert provide log collection, visualization, analysis, and alerting. |
 
 ## Features
@@ -81,7 +82,7 @@ Filebeat -> Elasticsearch -> Kibana -> ElastAlert
 - Supports multiple interacting honeypot nodes to form a honeynet.
 - Uses Docker to deploy custom HMI, simulated PLC, MQTT, HTTP, TCP Socket, and other services.
 - Captures, forwards, and records attack traffic through a Proxy layer.
-- Supports PostgreSQL, SQLite, and JSON log output.
+- Uses PostgreSQL for central Server storage and exports JSON logs for ELK/Filebeat analysis.
 - Integrates Filebeat, Elasticsearch, Kibana, and ElastAlert for analysis and alerting.
 - Provides a web dashboard for Agent management, honeypot deployment, and attack data review.
 
@@ -142,6 +143,8 @@ ADMIN_PASSWORD=change-me
 API_KEY=shared-agent-key
 SESSION_SECRET=change-this-session-secret
 SERVER_PORT=8000
+SERVER_API_ONLY=0
+SERVER_DISABLE_ELK=0
 SERVER_PUBLIC_URL=http://127.0.0.1:8000
 
 POSTGRES_DB=honeypot
@@ -149,9 +152,19 @@ POSTGRES_USER=honeypot
 POSTGRES_PASSWORD=honeypot_change_me
 POSTGRES_PORT=5432
 DATABASE_URL=postgresql://honeypot:honeypot_change_me@127.0.0.1:5432/honeypot
+SERVER_LOG_RETENTION_DAYS=30
+SERVER_JSON_LOG_RETENTION_DAYS=3
+SERVER_DAEMON_LOG_RETENTION_DAYS=30
+SERVER_LOG_CLEANUP_INTERVAL_SECONDS=86400
+SERVER_DAEMON_LOG_MODE=errors
+SERVER_DAEMON_LOG_MAX_BYTES=10485760
+SERVER_DAEMON_LOG_BACKUP_COUNT=3
+SERVER_UVICORN_LOG_LEVEL=warning
 ```
 
 `API_KEY` must match the Client Agent configuration so Agents can fetch deployment settings and upload logs. To deploy the Server on a custom port, change `SERVER_PORT` and make `SERVER_PUBLIC_URL` use the same port.
+The Server automatically deletes old data according to `.env`: `SERVER_LOG_RETENTION_DAYS` controls PostgreSQL logs and alerts, `SERVER_JSON_LOG_RETENTION_DAYS` controls `server/logs/*.json`, and `SERVER_DAEMON_LOG_RETENTION_DAYS` controls rotated `server.log.*` files.
+`SERVER_DAEMON_LOG_MODE=errors` makes daemon mode write only stderr/error tracebacks to `server.log`; use `full` for stdout+stderr or `off` to disable daemon log output. `SERVER_DAEMON_LOG_MAX_BYTES` and `SERVER_DAEMON_LOG_BACKUP_COUNT` control `server.log` rotation.
 
 ### 4. Configure Client Agent Environment Variables
 
@@ -192,12 +205,23 @@ After startup, open:
 
 If `server/.env` sets a custom port, for example `SERVER_PORT=8081`, the dashboard becomes `http://127.0.0.1:8081`. Open the same port in your EC2 Security Group or firewall.
 
-To start only the FastAPI Server without ELK:
+Common startup options:
 
 ```bash
-cd server
-python3 main.py
+# Start in the background
+./server/start_services.sh -d
+
+# Start PostgreSQL only; skip Elasticsearch / Kibana / Filebeat / ElastAlert
+./server/start_services.sh --no-elk
+
+# Serve API only; disable Dashboard / Login / Static / Swagger UI
+./server/start_services.sh --api-only
+
+# API-only, skip ELK, and run in the background
+./server/start_services.sh --api-only --no-elk -d
 ```
+
+`--no-elk` still starts PostgreSQL because the Server currently requires PostgreSQL storage; it only skips Elasticsearch, Kibana, Filebeat, and ElastAlert. In `--api-only` mode, API endpoints that normally require a browser session can be called with the `X-API-Key` header.
 
 ### 6. Start a Honeypot Agent
 
@@ -249,7 +273,6 @@ ICS-Honeypot/
 │   └── proxy/               # MQTT / HTTP / TCP / Modbus Proxy
 ├── server/                  # Central Server
 │   ├── main.py              # FastAPI app and dashboard
-│   ├── database.py          # SQLite fallback
 │   ├── postgres_database.py # PostgreSQL database operations
 │   ├── package_generators.py
 │   ├── static/

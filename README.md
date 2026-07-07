@@ -72,7 +72,8 @@ Filebeat -> Elasticsearch -> Kibana -> ElastAlert
 | Honeypot Agent | 部署於各蜜罐節點，接收 Server 設定，啟動 Docker 服務並回傳狀態與攻擊日誌。 |
 | Proxy Layer | 攔截並轉送 MQTT、HTTP、TCP、Modbus 等協定流量，產生結構化攻擊事件。 |
 | Docker Services | 實際執行蜜罐服務，可部署模擬 PLC、HMI、路燈控制服務或自訂服務。 |
-| PostgreSQL / SQLite | Server 使用 PostgreSQL 儲存日誌；Agent 使用 SQLite 作為本地暫存緩衝。 |
+| PostgreSQL | Server 使用 PostgreSQL 作為唯一的中央資料庫，儲存 Agent、日誌、告警與分析摘要。 |
+| Agent SQLite Buffer | Agent 使用 SQLite 作為本地暫存緩衝，負責離線或上傳前的短期資料保存。 |
 | ELK / ElastAlert | 使用 Filebeat、Elasticsearch、Kibana 與 ElastAlert 進行日誌分析、視覺化與告警。 |
 
 ## 功能特色
@@ -81,7 +82,7 @@ Filebeat -> Elasticsearch -> Kibana -> ElastAlert
 - 支援多蜜罐節點互動，形成蜜網環境。
 - 可透過 Docker 快速部署自製 HMI、模擬 PLC、MQTT、HTTP、TCP Socket 等服務。
 - 使用 Proxy 攔截、轉送並記錄攻擊流量。
-- 支援 PostgreSQL、SQLite 與 JSON 日誌輸出。
+- Server 僅使用 PostgreSQL 儲存中央資料，並輸出 JSON 日誌供 ELK/Filebeat 分析。
 - 可整合 Filebeat、Elasticsearch、Kibana 與 ElastAlert 進行分析與告警。
 - 提供 Web Dashboard 管理 Agent、部署蜜罐套件與查看攻擊資料。
 
@@ -197,6 +198,8 @@ ADMIN_PASSWORD=change-me
 API_KEY=shared-agent-key
 SESSION_SECRET=change-this-session-secret
 SERVER_PORT=8000
+SERVER_API_ONLY=0
+SERVER_DISABLE_ELK=0
 SERVER_PUBLIC_URL=http://127.0.0.1:8000
 
 POSTGRES_DB=honeypot
@@ -204,9 +207,19 @@ POSTGRES_USER=honeypot
 POSTGRES_PASSWORD=honeypot_change_me
 POSTGRES_PORT=5432
 DATABASE_URL=postgresql://honeypot:honeypot_change_me@127.0.0.1:5432/honeypot
+SERVER_LOG_RETENTION_DAYS=30
+SERVER_JSON_LOG_RETENTION_DAYS=3
+SERVER_DAEMON_LOG_RETENTION_DAYS=30
+SERVER_LOG_CLEANUP_INTERVAL_SECONDS=86400
+SERVER_DAEMON_LOG_MODE=errors
+SERVER_DAEMON_LOG_MAX_BYTES=10485760
+SERVER_DAEMON_LOG_BACKUP_COUNT=3
+SERVER_UVICORN_LOG_LEVEL=warning
 ```
 
 `API_KEY` 必須與 Client Agent 的設定一致，Agent 才能向 Server 取得部署設定並回傳日誌。若部署時要改 Server port，修改 `SERVER_PORT`，並讓 `SERVER_PUBLIC_URL` 使用相同 port。
+Server 會依 `.env` 的保留天數自動清除舊資料：`SERVER_LOG_RETENTION_DAYS` 控制 PostgreSQL 日誌與告警，`SERVER_JSON_LOG_RETENTION_DAYS` 控制 `server/logs/*.json`，`SERVER_DAEMON_LOG_RETENTION_DAYS` 控制輪替後的 `server.log.*`。
+`SERVER_DAEMON_LOG_MODE=errors` 會讓背景模式只把 stderr/error traceback 寫入 `server.log`；如需完整 stdout/stderr 可改為 `full`，完全不寫可改為 `off`。`SERVER_DAEMON_LOG_MAX_BYTES` 與 `SERVER_DAEMON_LOG_BACKUP_COUNT` 控制 `server.log` 大小輪替。
 
 ### 4. 設定 Client Agent 環境變數
 
@@ -247,12 +260,23 @@ API_KEY=shared-agent-key
 
 若 `server/.env` 設定了自訂 port，例如 `SERVER_PORT=8081`，Dashboard 會改為 `http://127.0.0.1:8081`，EC2 Security Group / 防火牆也需開放該 port。
 
-若只想啟動 FastAPI Server，不啟動 ELK：
+常用啟動選項：
 
 ```bash
-cd server
-python3 main.py
+# 背景啟動
+./server/start_services.sh -d
+
+# 只啟動 PostgreSQL，不啟動 Elasticsearch / Kibana / Filebeat / ElastAlert
+./server/start_services.sh --no-elk
+
+# 只提供 API，不掛載 Dashboard / Login / Static / Swagger UI
+./server/start_services.sh --api-only
+
+# API-only 並跳過 ELK，背景啟動
+./server/start_services.sh --api-only --no-elk -d
 ```
+
+`--no-elk` 仍會啟動 PostgreSQL，因為 Server 目前只支援 PostgreSQL 儲存；它只會跳過 Elasticsearch、Kibana、Filebeat 與 ElastAlert。`--api-only` 模式下原本需要登入 session 的 API 可改用 `X-API-Key` header 呼叫。
 
 ### 6. 啟動 Honeypot Agent
 
@@ -304,7 +328,6 @@ ICS-Honeypot/
 │   └── proxy/               # MQTT / HTTP / TCP / Modbus Proxy
 ├── server/                  # 中央 Server
 │   ├── main.py              # FastAPI app 與 Dashboard
-│   ├── database.py          # SQLite fallback
 │   ├── postgres_database.py # PostgreSQL 資料庫操作
 │   ├── package_generators.py
 │   ├── static/

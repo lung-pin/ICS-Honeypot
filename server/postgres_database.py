@@ -119,6 +119,10 @@ class PostgresServerDB:
                 CREATE INDEX IF NOT EXISTS idx_logs_ts_ip ON logs(timestamp, attacker_ip);
                 CREATE INDEX IF NOT EXISTS idx_logs_ts_id_desc ON logs(timestamp DESC, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_logs_ip_ts_desc ON logs(attacker_ip, timestamp DESC) WHERE attacker_ip IS NOT NULL AND attacker_ip != '';
+                CREATE INDEX IF NOT EXISTS idx_whitelist_logs_ip_id ON whitelist_logs(attacker_ip, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_whitelist_logs_id_desc ON whitelist_logs(id DESC);
+                CREATE INDEX IF NOT EXISTS idx_whitelist_logs_ts_id_desc ON whitelist_logs(timestamp DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_whitelist_logs_ip_ts_desc ON whitelist_logs(attacker_ip, timestamp DESC) WHERE attacker_ip IS NOT NULL AND attacker_ip != '';
                 CREATE INDEX IF NOT EXISTS idx_alerts_ip_id ON alerts(attacker_ip, id DESC);
                 CREATE INDEX IF NOT EXISTS idx_alerts_id_desc ON alerts(id DESC);
                 CREATE INDEX IF NOT EXISTS idx_alerts_ts_ip ON alerts(timestamp, attacker_ip);
@@ -587,6 +591,228 @@ class PostgresServerDB:
             return {"total_logs": row["total_logs"], "total_alerts": row["total_alerts"]}
         else:
             return {"total_logs": 0, "total_alerts": 0}
+
+    @staticmethod
+    def _deleted_count(command_tag):
+        try:
+            return int(str(command_tag).split()[-1])
+        except (TypeError, ValueError, IndexError):
+            return 0
+
+    async def _rebuild_ip_summaries(self, conn):
+        await conn.execute("TRUNCATE TABLE ip_summaries")
+        await conn.execute(
+            """
+            INSERT INTO ip_summaries
+                (ip, total_packets, protocols, node_ids, first_seen, last_seen)
+            SELECT
+                attacker_ip AS ip,
+                COUNT(*)::bigint AS total_packets,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT protocol) FILTER (WHERE protocol IS NOT NULL AND protocol != ''),
+                    ARRAY[]::text[]
+                ) AS protocols,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT node_id) FILTER (WHERE node_id IS NOT NULL AND node_id != ''),
+                    ARRAY[]::text[]
+                ) AS node_ids,
+                MIN(timestamp) AS first_seen,
+                MAX(timestamp) AS last_seen
+            FROM logs
+            WHERE attacker_ip IS NOT NULL AND attacker_ip != ''
+            GROUP BY attacker_ip
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO ip_summaries
+                (ip, protocols, node_ids, alert_count, max_severity)
+            SELECT
+                attacker_ip AS ip,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT protocol) FILTER (WHERE protocol IS NOT NULL AND protocol != ''),
+                    ARRAY[]::text[]
+                ) AS protocols,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT node_id) FILTER (WHERE node_id IS NOT NULL AND node_id != ''),
+                    ARRAY[]::text[]
+                ) AS node_ids,
+                COUNT(*)::bigint AS alert_count,
+                COALESCE(MIN(NULLIF(severity, 0)), 0) AS max_severity
+            FROM alerts
+            WHERE attacker_ip IS NOT NULL AND attacker_ip != ''
+            GROUP BY attacker_ip
+            ON CONFLICT (ip) DO UPDATE SET
+                protocols = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(ip_summaries.protocols || EXCLUDED.protocols) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                node_ids = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(ip_summaries.node_ids || EXCLUDED.node_ids) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                alert_count = EXCLUDED.alert_count,
+                max_severity = EXCLUDED.max_severity
+            """
+        )
+
+    async def _refresh_cleanup_ip_summaries(self, conn):
+        await conn.execute("SET LOCAL enable_hashjoin = off")
+        await conn.execute("SET LOCAL enable_mergejoin = off")
+        await conn.execute(
+            """
+            DELETE FROM ip_summaries s
+            USING cleanup_ips c
+            WHERE s.ip = c.ip
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO ip_summaries
+                (ip, total_packets, protocols, node_ids, first_seen, last_seen)
+            SELECT
+                l.attacker_ip AS ip,
+                COUNT(*)::bigint AS total_packets,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT l.protocol) FILTER (WHERE l.protocol IS NOT NULL AND l.protocol != ''),
+                    ARRAY[]::text[]
+                ) AS protocols,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT l.node_id) FILTER (WHERE l.node_id IS NOT NULL AND l.node_id != ''),
+                    ARRAY[]::text[]
+                ) AS node_ids,
+                MIN(l.timestamp) AS first_seen,
+                MAX(l.timestamp) AS last_seen
+            FROM cleanup_ips c
+            JOIN LATERAL (
+                SELECT attacker_ip, protocol, node_id, timestamp
+                FROM logs
+                WHERE attacker_ip = c.ip
+            ) l ON TRUE
+            WHERE l.attacker_ip IS NOT NULL AND l.attacker_ip != ''
+            GROUP BY l.attacker_ip
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO ip_summaries
+                (ip, protocols, node_ids, alert_count, max_severity)
+            SELECT
+                a.attacker_ip AS ip,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT a.protocol) FILTER (WHERE a.protocol IS NOT NULL AND a.protocol != ''),
+                    ARRAY[]::text[]
+                ) AS protocols,
+                COALESCE(
+                    ARRAY_AGG(DISTINCT a.node_id) FILTER (WHERE a.node_id IS NOT NULL AND a.node_id != ''),
+                    ARRAY[]::text[]
+                ) AS node_ids,
+                COUNT(*)::bigint AS alert_count,
+                COALESCE(MIN(NULLIF(a.severity, 0)), 0) AS max_severity
+            FROM cleanup_ips c
+            JOIN LATERAL (
+                SELECT attacker_ip, protocol, node_id, severity
+                FROM alerts
+                WHERE attacker_ip = c.ip
+            ) a ON TRUE
+            WHERE a.attacker_ip IS NOT NULL AND a.attacker_ip != ''
+            GROUP BY a.attacker_ip
+            ON CONFLICT (ip) DO UPDATE SET
+                protocols = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(ip_summaries.protocols || EXCLUDED.protocols) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                node_ids = (
+                    SELECT ARRAY(
+                        SELECT DISTINCT value
+                        FROM unnest(ip_summaries.node_ids || EXCLUDED.node_ids) AS value
+                        WHERE value IS NOT NULL AND value != ''
+                        ORDER BY value
+                    )
+                ),
+                alert_count = EXCLUDED.alert_count,
+                max_severity = EXCLUDED.max_severity
+            """
+        )
+
+    async def delete_old_server_logs(self, retention_days=30):
+        try:
+            retention_days = int(retention_days)
+        except (TypeError, ValueError):
+            retention_days = 30
+        if retention_days <= 0:
+            return {
+                "enabled": False,
+                "retention_days": retention_days,
+                "logs": 0,
+                "whitelist_logs": 0,
+                "alerts": 0,
+                "cutoff": None,
+            }
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+        pool = await self._ensure_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "CREATE TEMP TABLE cleanup_ips (ip TEXT PRIMARY KEY) ON COMMIT DROP"
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO cleanup_ips (ip)
+                    SELECT DISTINCT attacker_ip
+                    FROM logs
+                    WHERE timestamp < $1
+                      AND attacker_ip IS NOT NULL
+                      AND attacker_ip != ''
+                    ON CONFLICT DO NOTHING
+                    """,
+                    cutoff,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO cleanup_ips (ip)
+                    SELECT DISTINCT attacker_ip
+                    FROM alerts
+                    WHERE timestamp < $1
+                      AND attacker_ip IS NOT NULL
+                      AND attacker_ip != ''
+                    ON CONFLICT DO NOTHING
+                    """,
+                    cutoff,
+                )
+                await conn.execute("ANALYZE cleanup_ips")
+                deleted_logs = self._deleted_count(
+                    await conn.execute("DELETE FROM logs WHERE timestamp < $1", cutoff)
+                )
+                deleted_whitelist_logs = self._deleted_count(
+                    await conn.execute("DELETE FROM whitelist_logs WHERE timestamp < $1", cutoff)
+                )
+                deleted_alerts = self._deleted_count(
+                    await conn.execute("DELETE FROM alerts WHERE timestamp < $1", cutoff)
+                )
+                if deleted_logs or deleted_alerts:
+                    await self._refresh_cleanup_ip_summaries(conn)
+        return {
+            "enabled": True,
+            "retention_days": retention_days,
+            "logs": deleted_logs,
+            "whitelist_logs": deleted_whitelist_logs,
+            "alerts": deleted_alerts,
+            "cutoff": cutoff,
+        }
 
     async def delete_agent_logs(self, node_id):
         pool = await self._ensure_pool()

@@ -9,10 +9,10 @@ from typing import List, Dict, Optional, Any
 import asyncio
 import base64
 import binascii
+import contextlib
 import uvicorn
 import os
 import shutil
-import sqlite3
 import uuid
 import zipfile
 import json
@@ -20,8 +20,7 @@ import time
 import urllib.request
 import urllib.error
 from pathlib import Path
-from datetime import datetime
-from database import ServerDB
+from datetime import datetime, timedelta
 from postgres_database import PostgresServerDB
 from auth_config import load_secrets, verify_password, verify_api_key
 from package_generators import (
@@ -32,14 +31,12 @@ from package_generators import (
 
 # Resolve paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "server.db")
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
-if DATABASE_URL.startswith(("postgres://", "postgresql://")):
-    db = PostgresServerDB(DATABASE_URL)
-else:
-    db = ServerDB(DB_PATH)
+if not DATABASE_URL.startswith(("postgres://", "postgresql://")):
+    raise RuntimeError("DATABASE_URL must be set to a PostgreSQL URL. SQLite server storage is no longer supported.")
+db = PostgresServerDB(DATABASE_URL)
 
 
 # --- Per-agent whitelist ---------------------------------------------------
@@ -115,6 +112,48 @@ SERVER_PUBLIC_URL = os.environ.get("SERVER_PUBLIC_URL", "").strip()
 KIBANA_URL = os.environ.get("KIBANA_URL", "").strip()
 
 
+def _load_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"", "auto", "default"}:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
+def _load_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default)).strip() or str(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[maintenance] Invalid {name}={raw!r}; using {default}")
+        return default
+    return value
+
+
+SERVER_API_ONLY = (
+    _load_bool_env("SERVER_API_ONLY", False)
+    or _load_bool_env("SERVER_DISABLE_WEB", False)
+)
+SERVER_ELK_ENABLED = not _load_bool_env("SERVER_DISABLE_ELK", False)
+SERVER_LOG_RETENTION_DAYS = _load_positive_int_env("SERVER_LOG_RETENTION_DAYS", 30)
+SERVER_JSON_LOG_RETENTION_DAYS = _load_positive_int_env("SERVER_JSON_LOG_RETENTION_DAYS", 3)
+SERVER_DAEMON_LOG_RETENTION_DAYS = _load_positive_int_env("SERVER_DAEMON_LOG_RETENTION_DAYS", 30)
+SERVER_LOG_CLEANUP_INTERVAL_SECONDS = max(
+    60,
+    _load_positive_int_env("SERVER_LOG_CLEANUP_INTERVAL_SECONDS", 86400),
+)
+SERVER_LOG_CLEANUP_START_DELAY_SECONDS = max(
+    0,
+    _load_positive_int_env("SERVER_LOG_CLEANUP_START_DELAY_SECONDS", 5),
+)
+SERVER_UVICORN_LOG_LEVEL = os.environ.get("SERVER_UVICORN_LOG_LEVEL", "warning").strip().lower() or "warning"
+if SERVER_UVICORN_LOG_LEVEL not in {"critical", "error", "warning", "info", "debug", "trace"}:
+    print(f"[maintenance] Invalid SERVER_UVICORN_LOG_LEVEL={SERVER_UVICORN_LOG_LEVEL!r}; using warning")
+    SERVER_UVICORN_LOG_LEVEL = "warning"
+
+
 def get_server_public_url(request: Request = None) -> str:
     """Return the public server URL for client agents.
     Priority: SERVER_PUBLIC_URL env var > auto-detect from request host header > localhost fallback.
@@ -129,7 +168,11 @@ def get_server_public_url(request: Request = None) -> str:
     return f"http://localhost:{SERVER_PORT}"
 
 
-app = FastAPI(title="Honeypot Central Server")
+app = FastAPI(
+    title="Honeypot Central Server",
+    docs_url=None if SERVER_API_ONLY else "/docs",
+    redoc_url=None if SERVER_API_ONLY else "/redoc",
+)
 
 
 # Add CORS middleware for cross-origin requests (needed when frontend is served from a different domain)
@@ -144,11 +187,138 @@ app.add_middleware(
 # Add session middleware
 app.add_middleware(SessionMiddleware, secret_key=auth_secrets["session_secret"])
 
-# Mount static files
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+if not SERVER_API_ONLY:
+    # Mount static files and templates only when the Web UI is enabled.
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    templates = Jinja2Templates(directory=TEMPLATES_DIR)
+else:
+    templates = None
 
-# Templates
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+def _cleanup_files_for_target(directory: Path, patterns: List[str], retention_days: int) -> Dict[str, Any]:
+    if retention_days <= 0:
+        return {"files": 0, "bytes": 0, "errors": [], "cutoff": None}
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    cutoff_ts = cutoff.timestamp()
+    deleted_files = 0
+    deleted_bytes = 0
+    errors = []
+    if not directory.exists():
+        return {"files": 0, "bytes": 0, "errors": [], "cutoff": cutoff.isoformat()}
+    for pattern in patterns:
+        for path in directory.glob(pattern):
+            try:
+                if not path.is_file():
+                    continue
+                stat = path.stat()
+                if stat.st_mtime >= cutoff_ts:
+                    continue
+                deleted_bytes += stat.st_size
+                path.unlink()
+                deleted_files += 1
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+    return {
+        "files": deleted_files,
+        "bytes": deleted_bytes,
+        "errors": errors,
+        "cutoff": cutoff.isoformat(),
+    }
+
+
+def _cleanup_old_server_log_files() -> Dict[str, Any]:
+    targets = [
+        ("json", Path(BASE_DIR) / "logs", ["*.json"], SERVER_JSON_LOG_RETENTION_DAYS),
+        ("daemon", Path(BASE_DIR), ["server.log.*"], SERVER_DAEMON_LOG_RETENTION_DAYS),
+    ]
+    deleted_files = 0
+    deleted_bytes = 0
+    errors = []
+    by_target = {}
+
+    for name, directory, patterns, retention_days in targets:
+        stats = _cleanup_files_for_target(directory, patterns, retention_days)
+        by_target[name] = stats
+        deleted_files += stats.get("files", 0)
+        deleted_bytes += stats.get("bytes", 0)
+        errors.extend(stats.get("errors", []))
+
+    return {
+        "files": deleted_files,
+        "bytes": deleted_bytes,
+        "errors": errors,
+        "json_files": by_target.get("json", {}).get("files", 0),
+        "daemon_files": by_target.get("daemon", {}).get("files", 0),
+        "json_retention_days": SERVER_JSON_LOG_RETENTION_DAYS,
+        "daemon_retention_days": SERVER_DAEMON_LOG_RETENTION_DAYS,
+    }
+
+
+async def _run_server_log_cleanup_once():
+    db_stats = await db.delete_old_server_logs(SERVER_LOG_RETENTION_DAYS)
+    file_stats = _cleanup_old_server_log_files()
+    deleted_total = (
+        db_stats.get("logs", 0)
+        + db_stats.get("whitelist_logs", 0)
+        + db_stats.get("alerts", 0)
+        + file_stats.get("files", 0)
+    )
+    if deleted_total or file_stats.get("errors"):
+        print(
+            "[maintenance] server log cleanup "
+            f"retention={SERVER_LOG_RETENTION_DAYS}d "
+            f"db_logs={db_stats.get('logs', 0)} "
+            f"whitelist_logs={db_stats.get('whitelist_logs', 0)} "
+            f"alerts={db_stats.get('alerts', 0)} "
+            f"json_files={file_stats.get('json_files', 0)} "
+            f"daemon_files={file_stats.get('daemon_files', 0)} "
+            f"bytes={file_stats.get('bytes', 0)}"
+        )
+        for error in file_stats.get("errors", [])[:5]:
+            print(f"[maintenance] server log cleanup file error: {error}")
+
+
+async def _server_log_cleanup_loop():
+    if SERVER_LOG_CLEANUP_START_DELAY_SECONDS:
+        await asyncio.sleep(SERVER_LOG_CLEANUP_START_DELAY_SECONDS)
+    while True:
+        sleep_for = SERVER_LOG_CLEANUP_INTERVAL_SECONDS
+        try:
+            await _run_server_log_cleanup_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[maintenance] server log cleanup failed: {exc}")
+            sleep_for = min(300, SERVER_LOG_CLEANUP_INTERVAL_SECONDS)
+        await asyncio.sleep(sleep_for)
+
+
+@app.on_event("startup")
+async def _start_server_log_cleanup_task():
+    if (
+        SERVER_LOG_RETENTION_DAYS <= 0
+        and SERVER_JSON_LOG_RETENTION_DAYS <= 0
+        and SERVER_DAEMON_LOG_RETENTION_DAYS <= 0
+    ):
+        print("[maintenance] server log cleanup disabled because all retention settings are <= 0")
+        return
+    app.state.server_log_cleanup_task = asyncio.create_task(_server_log_cleanup_loop())
+    print(
+        "[maintenance] server log cleanup scheduled "
+        f"retention={SERVER_LOG_RETENTION_DAYS}d "
+        f"json_retention={SERVER_JSON_LOG_RETENTION_DAYS}d "
+        f"daemon_retention={SERVER_DAEMON_LOG_RETENTION_DAYS}d "
+        f"interval={SERVER_LOG_CLEANUP_INTERVAL_SECONDS}s"
+    )
+
+
+@app.on_event("shutdown")
+async def _stop_server_log_cleanup_task():
+    task = getattr(app.state, "server_log_cleanup_task", None)
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 # --- Auth Dependencies ---
@@ -159,9 +329,11 @@ async def require_api_key(x_api_key: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-async def require_session(request: Request):
+async def require_session(request: Request, x_api_key: str = Header(None)):
     """Dependency: require authenticated session for dashboard endpoints."""
     if not request.session.get("authenticated"):
+        if SERVER_API_ONLY and x_api_key and verify_api_key(x_api_key, auth_secrets["api_key"]):
+            return
         raise HTTPException(status_code=401, detail="Not authenticated")
 
 
@@ -176,25 +348,26 @@ async def require_api_key_or_session(request: Request, x_api_key: str = Header(N
 
 # --- Login / Logout Endpoints ---
 
-@app.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request):
-    return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": None})
+if not SERVER_API_ONLY:
+    @app.get("/login", response_class=HTMLResponse)
+    async def login_page(request: Request):
+        return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": None})
 
 
-@app.post("/login", response_class=HTMLResponse)
-async def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
-    if (username == auth_secrets["admin_username"]
-            and verify_password(password, auth_secrets["admin_password_hash"], auth_secrets["admin_salt"])):
-        request.session["authenticated"] = True
-        request.session["username"] = username
-        return RedirectResponse(url="/", status_code=303)
-    return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "Invalid username or password"})
+    @app.post("/login", response_class=HTMLResponse)
+    async def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+        if (username == auth_secrets["admin_username"]
+                and verify_password(password, auth_secrets["admin_password_hash"], auth_secrets["admin_salt"])):
+            request.session["authenticated"] = True
+            request.session["username"] = username
+            return RedirectResponse(url="/", status_code=303)
+        return templates.TemplateResponse(request=request, name="login.html", context={"request": request, "error": "Invalid username or password"})
 
 
-@app.post("/logout")
-async def logout(request: Request):
-    request.session.clear()
-    return RedirectResponse(url="/login", status_code=303)
+    @app.post("/logout")
+    async def logout(request: Request):
+        request.session.clear()
+        return RedirectResponse(url="/login", status_code=303)
 
 
 
@@ -467,8 +640,8 @@ async def update_whitelist(payload: Dict[str, Any]):
 @app.get("/api/server_info")
 async def server_info(request: Request):
     """Return server configuration info for the frontend (e.g., Kibana URL)."""
-    kibana_url = KIBANA_URL
-    if not kibana_url:
+    kibana_url = KIBANA_URL if SERVER_ELK_ENABLED else None
+    if SERVER_ELK_ENABLED and not kibana_url:
         # Auto-detect from current request host
         host = request.headers.get("host", "localhost")
         hostname = host.split(":")[0]  # Strip port
@@ -476,6 +649,11 @@ async def server_info(request: Request):
     return {
         "kibana_url": kibana_url,
         "server_url": get_server_public_url(request),
+        "api_only": SERVER_API_ONLY,
+        "elk_enabled": SERVER_ELK_ENABLED,
+        "log_retention_days": SERVER_LOG_RETENTION_DAYS,
+        "json_log_retention_days": SERVER_JSON_LOG_RETENTION_DAYS,
+        "daemon_log_retention_days": SERVER_DAEMON_LOG_RETENTION_DAYS,
     }
 
 
@@ -1083,17 +1261,18 @@ async def instantiate_service_template(template_id: str):
 
 # --- Web UI Endpoints ---
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    if not request.session.get("authenticated"):
-        return RedirectResponse(url="/login", status_code=303)
-    return templates.TemplateResponse(request=request, name="index.html", context={"request": request})
+if not SERVER_API_ONLY:
+    @app.get("/", response_class=HTMLResponse)
+    async def dashboard(request: Request):
+        if not request.session.get("authenticated"):
+            return RedirectResponse(url="/login", status_code=303)
+        return templates.TemplateResponse(request=request, name="index.html", context={"request": request})
 
-@app.get("/config/{node_id}", response_class=HTMLResponse)
-async def config_page(request: Request, node_id: str):
-    if not request.session.get("authenticated"):
-        return RedirectResponse(url="/login", status_code=303)
-    return templates.TemplateResponse(request=request, name="config.html", context={"request": request, "node_id": node_id})
+    @app.get("/config/{node_id}", response_class=HTMLResponse)
+    async def config_page(request: Request, node_id: str):
+        if not request.session.get("authenticated"):
+            return RedirectResponse(url="/login", status_code=303)
+        return templates.TemplateResponse(request=request, name="config.html", context={"request": request, "node_id": node_id})
 
 @app.get("/api/agents", dependencies=[Depends(require_session)])
 async def get_agents():
@@ -1195,7 +1374,7 @@ def _normalize_to_utc_iso(value: Optional[str]) -> Optional[str]:
     try:
         dt = _dt.fromisoformat(value)
     except ValueError:
-        return value  # let SQLite do its best — fail open
+        return value  # let PostgreSQL validate the value downstream.
     if dt.tzinfo is None:
         dt = dt.astimezone()  # attach local tz
     return dt.astimezone(_tz.utc).isoformat()
@@ -1241,13 +1420,6 @@ async def ip_analysis(
             exclude_ips=exclude_ips,
             hide_private_ips=hide_private_ips,
         )
-    except sqlite3.OperationalError as e:
-        detail = str(e)
-        if "locked" in detail.lower() or "busy" in detail.lower():
-            raise HTTPException(status_code=503, detail="IP analysis database is busy; retry shortly")
-        if "interrupted" in detail.lower():
-            raise HTTPException(status_code=503, detail="IP analysis query timed out; retry with a shorter time range")
-        raise HTTPException(status_code=500, detail=f"IP analysis database error: {detail}")
     except asyncio.TimeoutError:
         raise HTTPException(status_code=503, detail="IP analysis query timed out; retry with a shorter time range")
     except Exception as e:
@@ -1462,6 +1634,8 @@ async def update_agent_config(payload: Dict[str, Any]):
 
 @app.post("/api/admin/sync_elk", dependencies=[Depends(require_session)])
 async def sync_elk():
+    if not SERVER_ELK_ENABLED:
+        return {"status": "disabled", "message": "ELK is disabled for this server process"}
     try:
         import importlib
         elk_exporter = importlib.import_module("elk_exporter")
@@ -1473,4 +1647,11 @@ async def sync_elk():
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, reload=False, access_log=False)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=SERVER_PORT,
+        reload=False,
+        access_log=False,
+        log_level=SERVER_UVICORN_LOG_LEVEL,
+    )
