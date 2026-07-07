@@ -145,6 +145,7 @@ SESSION_SECRET=change-this-session-secret
 SERVER_PORT=8000
 SERVER_API_ONLY=0
 SERVER_DISABLE_ELK=0
+SERVER_DISABLE_KIBANA=0
 SERVER_PUBLIC_URL=http://127.0.0.1:8000
 
 POSTGRES_DB=honeypot
@@ -222,6 +223,9 @@ Common startup options:
 # Start PostgreSQL only; skip Elasticsearch / Kibana / Filebeat / ElastAlert
 ./server/start_services.sh --no-elk
 
+# Keep Elasticsearch / Filebeat / ElastAlert alerting, but skip Kibana
+./server/start_services.sh --no-kibana
+
 # Serve API only; disable Dashboard / Login / Static / Swagger UI
 ./server/start_services.sh --api-only
 
@@ -229,7 +233,7 @@ Common startup options:
 ./server/start_services.sh --api-only --no-elk -d
 ```
 
-`--no-elk` still starts PostgreSQL because the Server currently requires PostgreSQL storage; it only skips Elasticsearch, Kibana, Filebeat, and ElastAlert. In `--api-only` mode, API endpoints that normally require a browser session can be called with the `X-API-Key` header.
+`--no-elk` still starts PostgreSQL because the Server currently requires PostgreSQL storage; it only skips Elasticsearch, Kibana, Filebeat, and ElastAlert. `--no-kibana` keeps Elasticsearch, Filebeat, and ElastAlert running, so alerts still work without the Kibana UI. In `--api-only` mode, API endpoints that normally require a browser session can be called with the `X-API-Key` header.
 
 ### 6. Start a Honeypot Agent
 

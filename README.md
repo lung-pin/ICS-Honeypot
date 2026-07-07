@@ -200,6 +200,7 @@ SESSION_SECRET=change-this-session-secret
 SERVER_PORT=8000
 SERVER_API_ONLY=0
 SERVER_DISABLE_ELK=0
+SERVER_DISABLE_KIBANA=0
 SERVER_PUBLIC_URL=http://127.0.0.1:8000
 
 POSTGRES_DB=honeypot
@@ -277,6 +278,9 @@ AGENT_DAEMON_LOG_BACKUP_COUNT=3
 # 只啟動 PostgreSQL，不啟動 Elasticsearch / Kibana / Filebeat / ElastAlert
 ./server/start_services.sh --no-elk
 
+# 保留 Elasticsearch / Filebeat / ElastAlert 告警，但不啟動 Kibana
+./server/start_services.sh --no-kibana
+
 # 只提供 API，不掛載 Dashboard / Login / Static / Swagger UI
 ./server/start_services.sh --api-only
 
@@ -284,7 +288,7 @@ AGENT_DAEMON_LOG_BACKUP_COUNT=3
 ./server/start_services.sh --api-only --no-elk -d
 ```
 
-`--no-elk` 仍會啟動 PostgreSQL，因為 Server 目前只支援 PostgreSQL 儲存；它只會跳過 Elasticsearch、Kibana、Filebeat 與 ElastAlert。`--api-only` 模式下原本需要登入 session 的 API 可改用 `X-API-Key` header 呼叫。
+`--no-elk` 仍會啟動 PostgreSQL，因為 Server 目前只支援 PostgreSQL 儲存；它只會跳過 Elasticsearch、Kibana、Filebeat 與 ElastAlert。`--no-kibana` 會保留 Elasticsearch、Filebeat 與 ElastAlert，因此告警仍會作用，但不提供 Kibana 介面。`--api-only` 模式下原本需要登入 session 的 API 可改用 `X-API-Key` header 呼叫。
 
 ### 6. 啟動 Honeypot Agent
 

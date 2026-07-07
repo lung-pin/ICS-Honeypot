@@ -267,12 +267,15 @@ detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS_ID="$ID"
+        OS_VERSION="$VERSION_ID"
     elif [ "$(uname)" == "Darwin" ]; then
         OS_ID="macos"
+        OS_VERSION="$(sw_vers -productVersion)"
     else
         OS_ID="unknown"
+        OS_VERSION="unknown"
     fi
-    info "Detected OS: $OS_ID"
+    info "Detected OS: $OS_ID $OS_VERSION"
 }
 
 detect_os
@@ -283,69 +286,109 @@ detect_os
 install_deps() {
     info "Checking system dependencies..."
 
+    if [ "$OS_ID" == "macos" ]; then
+        if ! command -v docker &> /dev/null; then
+            fail "Docker not found. Install Docker Desktop from https://www.docker.com/products/docker-desktop/"
+        fi
+        if ! command -v python3 &> /dev/null; then
+            info "Installing Python 3 via Homebrew..."
+            brew install python3
+        fi
+        if ! command -v uv &> /dev/null; then
+            info "Installing uv..."
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+        fi
+        ok "macOS dependencies OK."
+        return
+    fi
+
+    if [ "$EUID" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        warn "Some packages may need sudo. You may be prompted for your password."
+    fi
+
     local SUDO=""
-    if [ "$EUID" -ne 0 ] 2>/dev/null; then
+    if [ "$EUID" -ne 0 ]; then
         SUDO="sudo"
     fi
 
-    # Install Docker if not present
-    if ! command -v docker &> /dev/null; then
-        if [ "$OS_ID" == "macos" ]; then
-            fail "Docker not found. Install Docker Desktop from https://www.docker.com/products/docker-desktop/"
-        elif [ "$OS_ID" == "ubuntu" ] || [ "$OS_ID" == "debian" ]; then
+    if [ "$OS_ID" == "ubuntu" ] || [ "$OS_ID" == "debian" ]; then
+        info "Installing system packages (apt)..."
+        $SUDO apt-get update -qq
+        $SUDO apt-get install -y -qq \
+            python3 \
+            python3-venv \
+            curl \
+            lsof \
+            git \
+            ca-certificates \
+            gnupg
+
+        if ! command -v docker &> /dev/null; then
             info "Installing Docker..."
-            $SUDO apt-get update -qq
-            $SUDO apt-get install -y -qq ca-certificates curl gnupg > /dev/null 2>&1
-            
             if apt-cache show docker.io &> /dev/null; then
-                $SUDO apt-get install -y -qq docker.io docker-compose-plugin > /dev/null 2>&1
+                $SUDO apt-get install -y -qq docker.io
             else
                 info "docker.io not in repos, using Docker official installer..."
                 curl -fsSL https://get.docker.com | $SUDO sh
-                
-                # Install compose plugin manually if needed
-                if ! docker compose version &> /dev/null; then
-                    info "Installing Docker Compose plugin manually..."
-                    DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker}
-                    $SUDO mkdir -p "$DOCKER_CONFIG/cli-plugins"
-                    $SUDO curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
-                        -o "$DOCKER_CONFIG/cli-plugins/docker-compose"
-                    $SUDO chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
-                fi
             fi
-        elif [ "$OS_ID" == "amzn" ]; then
-            info "Installing Docker..."
-            $SUDO dnf install -y docker > /dev/null 2>&1
         fi
+
+        if ! docker compose version &> /dev/null; then
+            if apt-cache show docker-compose-plugin &> /dev/null; then
+                $SUDO apt-get install -y -qq docker-compose-plugin
+            else
+                info "Installing Docker Compose plugin manually..."
+                DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker}
+                $SUDO mkdir -p "$DOCKER_CONFIG/cli-plugins"
+                $SUDO curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+                    -o "$DOCKER_CONFIG/cli-plugins/docker-compose"
+                $SUDO chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
+            fi
+        fi
+
+        ok "APT packages installed."
+
+    elif [ "$OS_ID" == "amzn" ]; then
+        info "Installing system packages (yum/dnf)..."
+        $SUDO dnf install -y \
+            python3 \
+            docker \
+            curl \
+            lsof \
+            git \
+            > /dev/null 2>&1
+
+        if ! docker compose version &> /dev/null; then
+            info "Installing Docker Compose plugin..."
+            DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+            mkdir -p "$DOCKER_CONFIG/cli-plugins"
+            curl -SL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
+                -o "$DOCKER_CONFIG/cli-plugins/docker-compose" 2>/dev/null
+            chmod +x "$DOCKER_CONFIG/cli-plugins/docker-compose"
+        fi
+        ok "DNF packages installed."
+
+    elif [ "$OS_ID" == "centos" ] || [ "$OS_ID" == "rhel" ]; then
+        info "Installing system packages (yum)..."
+        $SUDO yum install -y \
+            python3 \
+            docker \
+            curl \
+            lsof \
+            git \
+            > /dev/null 2>&1
+        ok "YUM packages installed."
+
+    else
+        warn "Unknown Linux distro: $OS_ID. Skipping system package install."
+        warn "Please manually install: python3, docker, docker-compose, lsof, curl, uv"
     fi
 
-    # Install Python if not present
-    if ! command -v python3 &> /dev/null; then
-        if [ "$OS_ID" == "ubuntu" ] || [ "$OS_ID" == "debian" ]; then
-            $SUDO apt-get install -y -qq python3 > /dev/null 2>&1
-        elif [ "$OS_ID" == "amzn" ]; then
-            $SUDO dnf install -y python3 > /dev/null 2>&1
-        elif [ "$OS_ID" == "macos" ]; then
-            brew install python3
-        fi
-    fi
-
-    # Install uv if not present
     if ! command -v uv &> /dev/null; then
         info "Installing uv..."
         curl -LsSf https://astral.sh/uv/install.sh | sh
         export PATH="$HOME/.local/bin:$PATH"
-    fi
-
-    # Install other tools
-    if [ "$OS_ID" != "macos" ]; then
-        if ! command -v lsof &> /dev/null || ! command -v curl &> /dev/null; then
-            if [ "$OS_ID" == "ubuntu" ] || [ "$OS_ID" == "debian" ]; then
-                $SUDO apt-get install -y -qq curl lsof git > /dev/null 2>&1
-            elif [ "$OS_ID" == "amzn" ]; then
-                $SUDO dnf install -y curl lsof git > /dev/null 2>&1
-            fi
-        fi
     fi
 
     # Ensure Docker service is running (Linux only)
@@ -373,6 +416,7 @@ info "Verifying core tools..."
 command -v docker &> /dev/null || fail "Docker is not installed."
 command -v python3 &> /dev/null || fail "Python 3 is not installed."
 command -v uv &> /dev/null || fail "uv is not installed. Run: curl -LsSf https://astral.sh/uv/install.sh | sh"
+(docker compose version &> /dev/null || docker-compose --version &> /dev/null) || fail "Docker Compose is not installed."
 ok "docker:  $(docker --version | head -1)"
 ok "uv:      $(uv --version)"
 ok "python3: $(python3 --version)"

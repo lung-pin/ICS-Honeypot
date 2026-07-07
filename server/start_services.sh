@@ -17,6 +17,7 @@ LOG_FILE="$SCRIPT_DIR/server.log"
 DAEMON_MODE=false
 API_ONLY_MODE=false
 SKIP_ELK=false
+DISABLE_KIBANA=false
 SERVER_PORT=8000
 SERVER_DAEMON_LOG_MODE=errors
 SERVER_DAEMON_LOG_MAX_BYTES=10485760
@@ -58,6 +59,7 @@ _load_server_env_config() {
     local configured_port=""
     local configured_api_only=""
     local configured_disable_elk=""
+    local configured_disable_kibana=""
     local configured_log_mode=""
     local configured_log_max_bytes=""
     local configured_log_backup_count=""
@@ -66,6 +68,7 @@ _load_server_env_config() {
         configured_port=$(grep -E "^SERVER_PORT=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
         configured_api_only=$(grep -E "^SERVER_API_ONLY=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
         configured_disable_elk=$(grep -E "^SERVER_DISABLE_ELK=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
+        configured_disable_kibana=$(grep -E "^SERVER_DISABLE_KIBANA=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
         configured_log_mode=$(grep -E "^SERVER_DAEMON_LOG_MODE=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
         configured_log_max_bytes=$(grep -E "^SERVER_DAEMON_LOG_MAX_BYTES=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
         configured_log_backup_count=$(grep -E "^SERVER_DAEMON_LOG_BACKUP_COUNT=" "$SCRIPT_DIR/.env" | tail -1 | cut -d'=' -f2- | xargs)
@@ -81,6 +84,9 @@ _load_server_env_config() {
     fi
     if _is_truthy "$configured_disable_elk"; then
         SKIP_ELK=true
+    fi
+    if _is_truthy "$configured_disable_kibana"; then
+        DISABLE_KIBANA=true
     fi
     configured_log_mode="${configured_log_mode:-errors}"
     configured_log_mode="$(printf '%s' "$configured_log_mode" | tr '[:upper:]' '[:lower:]')"
@@ -109,6 +115,45 @@ _load_server_env_config() {
 }
 
 _load_server_env_config
+
+_configure_single_node_elasticsearch() {
+    local es_url="http://127.0.0.1:9200"
+    local ready=false
+    local i
+
+    for i in $(seq 1 60); do
+        if curl -fsS --max-time 3 "$es_url/_cluster/health" >/dev/null 2>&1; then
+            ready=true
+            break
+        fi
+        sleep 2
+    done
+
+    if [ "$ready" != true ]; then
+        warn "Elasticsearch did not become ready in time; skipping single-node index tuning."
+        return 0
+    fi
+
+    local template_body
+    template_body='{"order":100,"index_patterns":["honeypot-*"],"settings":{"number_of_replicas":0}}'
+    curl -fsS --max-time 10 \
+        -X PUT "$es_url/_template/honeypot-single-node" \
+        -H 'Content-Type: application/json' \
+        -d "$template_body" >/dev/null || warn "Failed to apply honeypot Elasticsearch template."
+
+    template_body='{"order":100,"index_patterns":["elastalert_status*"],"settings":{"number_of_replicas":0}}'
+    curl -fsS --max-time 10 \
+        -X PUT "$es_url/_template/elastalert-single-node" \
+        -H 'Content-Type: application/json' \
+        -d "$template_body" >/dev/null || warn "Failed to apply ElastAlert Elasticsearch template."
+
+    curl -fsS --max-time 20 \
+        -X PUT "$es_url/honeypot-*,elastalert_status*/_settings?ignore_unavailable=true&allow_no_indices=true" \
+        -H 'Content-Type: application/json' \
+        -d '{"index":{"number_of_replicas":0}}' >/dev/null || warn "Failed to update existing Elasticsearch index replicas."
+
+    ok "Elasticsearch single-node index settings applied."
+}
 
 # ─────────────────────────────────────────
 # 3. Command Handling (stop / status / logs)
@@ -213,6 +258,7 @@ print_usage() {
     echo "  -d, --daemon          Start in background"
     echo "  --api-only, --no-web  Start API only; disable Web UI/static pages"
     echo "  --no-elk, --skip-elk  Start PostgreSQL only; skip Elasticsearch/Kibana/Filebeat/ElastAlert"
+    echo "  --no-kibana           Start PostgreSQL + Elasticsearch + Filebeat + ElastAlert; skip Kibana"
     echo ""
     echo "Commands:"
     echo "  stop                  Stop background server and Docker services"
@@ -237,6 +283,9 @@ while [ $# -gt 0 ]; do
             ;;
         --no-elk|--skip-elk)
             SKIP_ELK=true
+            ;;
+        --no-kibana|--alert-only-elk)
+            DISABLE_KIBANA=true
             ;;
         -h|--help)
             print_usage
@@ -549,6 +598,7 @@ SESSION_SECRET=${SESSION_SECRET}
 SERVER_PORT=8000
 SERVER_API_ONLY=0
 SERVER_DISABLE_ELK=0
+SERVER_DISABLE_KIBANA=0
 SERVER_DAEMON_LOG_MODE=errors
 SERVER_DAEMON_LOG_MAX_BYTES=10485760
 SERVER_DAEMON_LOG_BACKUP_COUNT=3
@@ -592,6 +642,12 @@ EOF
 SERVER_DISABLE_ELK=0
 EOF
             ok "Added SERVER_DISABLE_ELK default to server/.env."
+        fi
+        if ! grep -qE "^SERVER_DISABLE_KIBANA=" "$SCRIPT_DIR/.env"; then
+            cat >> "$SCRIPT_DIR/.env" <<'EOF'
+SERVER_DISABLE_KIBANA=0
+EOF
+            ok "Added SERVER_DISABLE_KIBANA default to server/.env."
         fi
         if ! grep -qE "^SERVER_DAEMON_LOG_MODE=" "$SCRIPT_DIR/.env"; then
             cat >> "$SCRIPT_DIR/.env" <<'EOF'
@@ -741,6 +797,8 @@ _rotate_daemon_log_if_needed
 # ─────────────────────────────────────────
 if [ "$SKIP_ELK" = true ]; then
     info "Starting PostgreSQL only (ELK disabled)..."
+elif [ "$DISABLE_KIBANA" = true ]; then
+    info "Starting PostgreSQL and alerting stack without Kibana..."
 else
     info "Starting PostgreSQL and ELK Stack (Docker)..."
 fi
@@ -788,10 +846,19 @@ if [ "$SKIP_ELK" = true ]; then
     fi
     $COMPOSE_CMD stop elasticsearch kibana filebeat elastalert >/dev/null 2>&1 || true
     ok "PostgreSQL started. ELK services skipped."
+elif [ "$DISABLE_KIBANA" = true ]; then
+    if ! $COMPOSE_CMD up -d --force-recreate postgres elasticsearch filebeat elastalert; then
+        fail "Failed to start PostgreSQL/alerting stack. Ensure Docker is running."
+    fi
+    $COMPOSE_CMD stop kibana >/dev/null 2>&1 || true
+    $COMPOSE_CMD rm -f kibana >/dev/null 2>&1 || true
+    _configure_single_node_elasticsearch
+    ok "PostgreSQL and alerting stack started (Elasticsearch, Filebeat, ElastAlert). Kibana skipped."
 else
     if ! $COMPOSE_CMD up -d --force-recreate; then
         fail "Failed to start PostgreSQL/ELK stack. Ensure Docker is running."
     fi
+    _configure_single_node_elasticsearch
     ok "PostgreSQL and ELK Stack started (Elasticsearch, Kibana, Filebeat, ElastAlert)."
 fi
 
@@ -834,6 +901,9 @@ else
 fi
 if [ "$SKIP_ELK" = true ]; then
     echo -e "  ELK:       ${YELLOW}disabled${NC}"
+elif [ "$DISABLE_KIBANA" = true ]; then
+    echo -e "  Alerting:  ${CYAN}Elasticsearch + Filebeat + ElastAlert${NC}"
+    echo -e "  Kibana:    ${YELLOW}disabled${NC}"
 else
     echo -e "  Kibana:    ${CYAN}${KIBANA_URL}${NC}"
 fi
