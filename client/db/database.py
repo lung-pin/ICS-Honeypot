@@ -186,6 +186,73 @@ class LogDB:
                 if conn:
                     conn.close()
 
+    def delete_oldest_logs(self, batch_size=5000, vacuum=False):
+        """Delete oldest local rows in bounded batches.
+
+        Used by the disk guard when the host crosses the configured disk usage
+        threshold. VACUUM is optional because it can be expensive, but it is the
+        only way SQLite returns deleted pages to the filesystem immediately.
+        """
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            batch_size = 5000
+        batch_size = max(1, min(batch_size, 100000))
+
+        with self._lock:
+            conn = None
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    DELETE FROM logs
+                    WHERE id IN (
+                        SELECT id FROM logs
+                        ORDER BY timestamp ASC, id ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (batch_size,),
+                )
+                deleted_logs = cursor.rowcount if cursor.rowcount is not None else 0
+                cursor.execute(
+                    """
+                    DELETE FROM whitelist_logs
+                    WHERE id IN (
+                        SELECT id FROM whitelist_logs
+                        ORDER BY timestamp ASC, id ASC
+                        LIMIT ?
+                    )
+                    """,
+                    (batch_size,),
+                )
+                deleted_whitelist_logs = cursor.rowcount if cursor.rowcount is not None else 0
+                conn.commit()
+                if vacuum and (deleted_logs or deleted_whitelist_logs):
+                    cursor.execute("VACUUM")
+                if deleted_logs or deleted_whitelist_logs:
+                    print(
+                        f"[LogDB] Disk guard deleted local rows "
+                        f"(logs={deleted_logs}, whitelist_logs={deleted_whitelist_logs})"
+                    )
+                return {
+                    "logs": deleted_logs,
+                    "whitelist_logs": deleted_whitelist_logs,
+                    "batch_size": batch_size,
+                }
+            except sqlite3.Error as e:
+                print(f"[LogDB] Error deleting oldest logs: {e}")
+                return {
+                    "logs": 0,
+                    "whitelist_logs": 0,
+                    "batch_size": batch_size,
+                    "error": str(e),
+                }
+            finally:
+                if conn:
+                    conn.close()
+
     @staticmethod
     def _private_ip_where_sql(column="attacker_ip"):
         return (

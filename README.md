@@ -133,6 +133,9 @@ Filebeat -> Elasticsearch -> Kibana -> ElastAlert
 | `GET` | `/api/ip_analysis` | Session | 依攻擊者 IP 分組統計攻擊量、協定、觸及節點、告警數與最高嚴重度。支援 `hours`、`from_ts`、`to_ts`、`page`、`page_size`、`search`、`hide_agent_ips`、`hide_private_ips`。 |
 | `GET` | `/api/ip_details/{ip}?limit=200` | Session | 查詢單一攻擊者 IP 的封包紀錄與相關告警。 |
 | `GET` | `/api/alerts?limit=200&ip={ip}` | Session | 查詢告警清單，可依攻擊者 IP 過濾。 |
+| `GET` | `/api/external_archive?limit=200&page=1&search={ip}` | Session | 查詢永久保存的外部攻擊 IP 摘要；此資料不會被一般 log 清理或 disk guard 刪除。 |
+| `GET` | `/api/external_archive/daily?ip={ip}&days=30` | Session | 查詢永久 archive 的每日統計，包含外部 IP 在各日期、協定與節點的攻擊量與告警數。 |
+| `POST` | `/api/admin/rebuild_external_archive` | Session | 從目前 PostgreSQL hot logs / alerts 重新建立外部攻擊永久 archive，適合啟用功能後手動補歷史資料。 |
 | `POST` | `/api/admin/sync_elk` | Session | 手動將 Server 日誌匯出給 Filebeat / ELK 使用。 |
 
 ### Profile、Package 與 Service Template
@@ -217,10 +220,17 @@ SERVER_DAEMON_LOG_MAX_BYTES=10485760
 SERVER_DAEMON_LOG_BACKUP_COUNT=3
 SERVER_UVICORN_LOG_LEVEL=warning
 DROP_PRIVATE_IP_LOGS=true
+SERVER_EXTERNAL_ARCHIVE_ENABLED=true
+SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES=512
+SERVER_DISK_GUARD_ENABLED=true
+SERVER_DISK_USAGE_MAX_PERCENT=80
+SERVER_DISK_USAGE_TARGET_PERCENT=75
 ```
 
 `API_KEY` 必須與 Client Agent 的設定一致，Agent 才能向 Server 取得部署設定並回傳日誌。若部署時要改 Server port，修改 `SERVER_PORT`，並讓 `SERVER_PUBLIC_URL` 使用相同 port。
 Server 會依 `.env` 的保留天數自動清除舊資料：`SERVER_LOG_RETENTION_DAYS` 控制 PostgreSQL 日誌與告警，`SERVER_JSON_LOG_RETENTION_DAYS` 控制 `server/logs/*.json`，`SERVER_DAEMON_LOG_RETENTION_DAYS` 控制輪替後的 `server.log.*`。
+`SERVER_EXTERNAL_ARCHIVE_ENABLED=true` 會永久保存真正外部攻擊 IP 的輕量摘要，資料寫入 `external_attack_archive` 與 `external_attack_daily`，不會被 30 天清理或 disk guard 刪除；`SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES` 控制保存的 request sample 長度。
+`SERVER_DISK_GUARD_ENABLED=true` 會在磁碟使用率達到 `SERVER_DISK_USAGE_MAX_PERCENT` 時啟動保護，優先從最舊的 `server/logs/*.json`、Elasticsearch `honeypot-*` index、PostgreSQL logs / whitelist_logs / alerts 開始刪除，直到接近 `SERVER_DISK_USAGE_TARGET_PERCENT`。
 `SERVER_DAEMON_LOG_MODE=errors` 會讓背景模式只把 stderr/error traceback 寫入 `server.log`；如需完整 stdout/stderr 可改為 `full`，完全不寫可改為 `off`。`SERVER_DAEMON_LOG_MAX_BYTES` 與 `SERVER_DAEMON_LOG_BACKUP_COUNT` 控制 `server.log` 大小輪替。
 `DROP_PRIVATE_IP_LOGS=true` 會讓 Server 入庫前丟棄 loopback、RFC1918、Docker bridge 等內部 IP 流量，避免內部服務互傳佔滿 PostgreSQL 與 ELK JSON log。
 
@@ -240,6 +250,9 @@ DROP_PRIVATE_IP_LOGS=true
 AGENT_DAEMON_LOG_MODE=errors
 AGENT_DAEMON_LOG_MAX_BYTES=10485760
 AGENT_DAEMON_LOG_BACKUP_COUNT=3
+CLIENT_DISK_GUARD_ENABLED=true
+CLIENT_DISK_USAGE_MAX_PERCENT=80
+CLIENT_DISK_USAGE_TARGET_PERCENT=75
 ```
 
 確認 `client/client_config.json` 內的 `node_id` 與 `server_url`：
@@ -254,6 +267,7 @@ AGENT_DAEMON_LOG_BACKUP_COUNT=3
 
 若 Agent 與 Server 位於不同主機，請將 `server_url` 改成 Server 的實際 IP 或網域。如果 `server/.env` 使用自訂 `SERVER_PORT`，這裡的 `server_url` 也要使用相同 port。
 `DROP_PRIVATE_IP_LOGS=true` 會讓 Agent 在寫入 proxy JSONL 與本地 SQLite 前丟棄 `127.0.0.1`、`172.16.0.0/12`、`192.168.0.0/16`、`10.0.0.0/8` 等內部 IP 流量。
+`CLIENT_DISK_GUARD_ENABLED=true` 會在磁碟使用率達到 `CLIENT_DISK_USAGE_MAX_PERCENT` 時，從最舊的 Agent 旋轉 log、runtime/proxy log 與本地 SQLite rows 開始清除，並可透過 `CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true` 讓 SQLite 立即釋放檔案空間。
 `AGENT_DAEMON_LOG_MODE=errors` 會讓背景模式只把 stderr/error traceback 寫入 `agent.log`；如需完整 stdout/stderr 可改為 `full`，完全不寫可改為 `off`。`AGENT_DAEMON_LOG_MAX_BYTES` 與 `AGENT_DAEMON_LOG_BACKUP_COUNT` 控制 `agent.log` 大小輪替。
 
 ### 5. 啟動 Server 與分析服務

@@ -517,7 +517,8 @@
             const p = l.protocol || "unknown";
             protos[p] = (protos[p] || 0) + 1;
             const meta = parseMaybeJson(l.metadata) || {};
-            if (meta.dst_port) ports.add(meta.dst_port);
+            const network = getLogNetwork(meta);
+            if (network.dst_port) ports.add(network.dst_port);
             if (!firstSeen || l.timestamp < firstSeen) firstSeen = l.timestamp;
             if (!lastSeen || l.timestamp > lastSeen) lastSeen = l.timestamp;
         });

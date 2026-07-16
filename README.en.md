@@ -96,6 +96,7 @@ Most core data and management functions are exposed through FastAPI. Web managem
 | Agent synchronization | Agent heartbeat, node configuration retrieval, and deployment configuration updates. |
 | Attack data | Upload attack logs, query recent logs, dashboard statistics, attacker-IP analysis, and per-IP details. |
 | Alerts | Query alerts and ingest alerts from ElastAlert or external systems. |
+| External archive | Query permanent compact external-attacker summaries via `/api/external_archive`, daily trends via `/api/external_archive/daily`, and manually backfill current hot logs with `POST /api/admin/rebuild_external_archive`. |
 | Whitelist | Query and update whitelist entries, and inspect whitelist hit logs. |
 | Deployment packages | Import ZIP / JSON packages, query the package library, and delete packages. |
 | Service templates | List service templates and instantiate a template into an Agent config page. |
@@ -162,10 +163,17 @@ SERVER_DAEMON_LOG_MAX_BYTES=10485760
 SERVER_DAEMON_LOG_BACKUP_COUNT=3
 SERVER_UVICORN_LOG_LEVEL=warning
 DROP_PRIVATE_IP_LOGS=true
+SERVER_EXTERNAL_ARCHIVE_ENABLED=true
+SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES=512
+SERVER_DISK_GUARD_ENABLED=true
+SERVER_DISK_USAGE_MAX_PERCENT=80
+SERVER_DISK_USAGE_TARGET_PERCENT=75
 ```
 
 `API_KEY` must match the Client Agent configuration so Agents can fetch deployment settings and upload logs. To deploy the Server on a custom port, change `SERVER_PORT` and make `SERVER_PUBLIC_URL` use the same port.
 The Server automatically deletes old data according to `.env`: `SERVER_LOG_RETENTION_DAYS` controls PostgreSQL logs and alerts, `SERVER_JSON_LOG_RETENTION_DAYS` controls `server/logs/*.json`, and `SERVER_DAEMON_LOG_RETENTION_DAYS` controls rotated `server.log.*` files.
+`SERVER_EXTERNAL_ARCHIVE_ENABLED=true` permanently stores compact summaries for real external attacker IPs in `external_attack_archive` and `external_attack_daily`; this archive is not removed by normal retention cleanup or the disk guard. `SERVER_EXTERNAL_ARCHIVE_SAMPLE_BYTES` controls the saved request sample length.
+`SERVER_DISK_GUARD_ENABLED=true` starts a disk guard when usage reaches `SERVER_DISK_USAGE_MAX_PERCENT`; it deletes the oldest `server/logs/*.json`, Elasticsearch `honeypot-*` indices, and PostgreSQL logs / whitelist_logs / alerts until usage is near `SERVER_DISK_USAGE_TARGET_PERCENT`.
 `SERVER_DAEMON_LOG_MODE=errors` makes daemon mode write only stderr/error tracebacks to `server.log`; use `full` for stdout+stderr or `off` to disable daemon log output. `SERVER_DAEMON_LOG_MAX_BYTES` and `SERVER_DAEMON_LOG_BACKUP_COUNT` control `server.log` rotation.
 `DROP_PRIVATE_IP_LOGS=true` makes the Server discard loopback, RFC1918, and Docker bridge traffic before storing logs, preventing internal service traffic from filling PostgreSQL and ELK JSON logs.
 
@@ -185,6 +193,9 @@ DROP_PRIVATE_IP_LOGS=true
 AGENT_DAEMON_LOG_MODE=errors
 AGENT_DAEMON_LOG_MAX_BYTES=10485760
 AGENT_DAEMON_LOG_BACKUP_COUNT=3
+CLIENT_DISK_GUARD_ENABLED=true
+CLIENT_DISK_USAGE_MAX_PERCENT=80
+CLIENT_DISK_USAGE_TARGET_PERCENT=75
 ```
 
 Check `client/client_config.json` for `node_id` and `server_url`:
@@ -199,6 +210,7 @@ Check `client/client_config.json` for `node_id` and `server_url`:
 
 If the Agent and Server are on different machines, change `server_url` to the Server's actual IP address or domain. If `server/.env` uses a custom `SERVER_PORT`, this `server_url` must use the same port.
 `DROP_PRIVATE_IP_LOGS=true` makes the Agent discard internal IP traffic such as `127.0.0.1`, `172.16.0.0/12`, `192.168.0.0/16`, and `10.0.0.0/8` before writing proxy JSONL or local SQLite logs.
+`CLIENT_DISK_GUARD_ENABLED=true` starts a disk guard when usage reaches `CLIENT_DISK_USAGE_MAX_PERCENT`; it deletes the oldest rotated Agent logs, runtime/proxy logs, and local SQLite rows. `CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true` makes SQLite release deleted space back to the filesystem.
 `AGENT_DAEMON_LOG_MODE=errors` makes daemon mode write only stderr/error tracebacks to `agent.log`; use `full` for stdout+stderr or `off` to disable agent log output. `AGENT_DAEMON_LOG_MAX_BYTES` and `AGENT_DAEMON_LOG_BACKUP_COUNT` control `agent.log` rotation.
 
 ### 5. Start the Server and Analysis Services
