@@ -21,6 +21,7 @@ MQTT 路徑與本檔案無關；MQTT 流量由 mosquitto + gateway/subscriber �
 import json
 import os
 import socket
+from datetime import datetime, timedelta, timezone
 import socketserver
 import threading
 import time
@@ -64,6 +65,10 @@ SUBSCRIBER_API_TOKEN = os.environ.get("SUBSCRIBER_API_TOKEN", API_TOKEN).strip()
 
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 MONGO_DB = os.environ.get("MONGO_DB", "streetlight").strip()
+try:
+    MONGO_LOG_RETENTION_DAYS = max(1, int(os.environ.get("MONGO_LOG_RETENTION_DAYS", "30")))
+except (TypeError, ValueError):
+    MONGO_LOG_RETENTION_DAYS = 30
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streetlight_data.json")
 CMD_NAMES = {}
@@ -112,6 +117,49 @@ def parse_meta(hex_data):
 
 # ---------- MongoDB ----------
 
+def _ensure_command_log_retention(collection):
+    """Delete expired legacy rows first, then enable TTL for all retained/new rows."""
+    retention_seconds = MONGO_LOG_RETENTION_DAYS * 86400
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MONGO_LOG_RETENTION_DAYS)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+    deleted = collection.delete_many(
+        {"created_at": {"$exists": False}, "ts": {"$lt": cutoff_iso}}
+    ).deleted_count
+    if deleted:
+        print(f"[TCPManagement] [MongoDB] 已刪除 {deleted} 筆逾期 command_logs")
+
+    # Older deployments stored only an ISO string in `ts`. Backfill a BSON Date
+    # so MongoDB's TTL monitor can expire those retained rows without a restart.
+    collection.update_many(
+        {"created_at": {"$exists": False}},
+        [
+            {
+                "$set": {
+                    "created_at": {
+                        "$convert": {
+                            "input": "$ts",
+                            "to": "date",
+                            "onError": {"$toDate": "$_id"},
+                            "onNull": {"$toDate": "$_id"},
+                        }
+                    }
+                }
+            }
+        ],
+    )
+
+    ttl_name = "created_at_ttl"
+    ttl_index = collection.index_information().get(ttl_name)
+    if ttl_index and ttl_index.get("expireAfterSeconds") != retention_seconds:
+        collection.drop_index(ttl_name)
+    collection.create_index(
+        "created_at",
+        expireAfterSeconds=retention_seconds,
+        name=ttl_name,
+    )
+
+
 class MongoStore:
     def __init__(self, uri, db_name):
         self.uri = uri
@@ -139,8 +187,10 @@ class MongoStore:
                 client = MongoClient(self.uri, serverSelectionTimeoutMS=3000)
                 client.admin.command("ping")
                 db = client[self.db_name]
-                db["command_logs"].create_index("ts")
-                db["command_logs"].create_index("mac")
+                command_logs = db["command_logs"]
+                _ensure_command_log_retention(command_logs)
+                command_logs.create_index("ts")
+                command_logs.create_index("mac")
                 db["runtime"].create_index("mac", unique=True)
                 self.client = client
                 self.db = db
@@ -166,6 +216,7 @@ class MongoStore:
         if not self.enabled():
             return
         try:
+            doc.setdefault("created_at", datetime.now(timezone.utc))
             with self._lock:
                 self.db["command_logs"].insert_one(doc)
         except PyMongoError as e:

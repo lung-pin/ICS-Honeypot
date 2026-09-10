@@ -30,21 +30,14 @@ def _env_bool(name, default=False):
     return value in {"1", "true", "yes", "on"}
 
 
-def _env_int(name, default):
+def _env_int(name, default, minimum=0):
     raw = os.environ.get(name, str(default)).strip() or str(default)
     try:
-        return int(raw)
-    except ValueError:
+        value = int(raw)
+    except (TypeError, ValueError):
         print(f"[Agent] Invalid {name}={raw!r}; using {default}")
-        return default
-
-
-def _env_percent(name, default):
-    value = _env_int(name, default)
-    if not 1 <= value <= 100:
-        print(f"[Agent] Invalid {name}={value!r}; using {default}")
-        return default
-    return value
+        value = default
+    return max(minimum, value)
 
 
 def _get_local_ip():
@@ -111,20 +104,35 @@ class NodeAgent:
         self.log_cleanup_interval = int(os.environ.get("CLIENT_LOG_CLEANUP_INTERVAL_SECONDS", "3600"))
         self.drop_private_ip_logs = drop_private_ip_logs_enabled()
         self._last_log_cleanup_time = 0
+
         self.disk_guard_enabled = _env_bool("CLIENT_DISK_GUARD_ENABLED", True)
-        self.disk_usage_max_percent = _env_percent("CLIENT_DISK_USAGE_MAX_PERCENT", 80)
-        self.disk_usage_target_percent = _env_percent("CLIENT_DISK_USAGE_TARGET_PERCENT", 75)
+        self.disk_usage_max_percent = min(
+            99, _env_int("CLIENT_DISK_USAGE_MAX_PERCENT", 80, minimum=1)
+        )
+        self.disk_usage_target_percent = min(
+            98, _env_int("CLIENT_DISK_USAGE_TARGET_PERCENT", 75, minimum=1)
+        )
         if self.disk_usage_target_percent >= self.disk_usage_max_percent:
             self.disk_usage_target_percent = max(1, self.disk_usage_max_percent - 5)
         self.disk_guard_path = os.environ.get("CLIENT_DISK_GUARD_PATH", "/").strip() or "/"
-        self.disk_guard_interval = max(60, _env_int("CLIENT_DISK_GUARD_INTERVAL_SECONDS", 300))
-        self.disk_guard_batch_rows = max(1, _env_int("CLIENT_DISK_GUARD_BATCH_ROWS", 5000))
-        self.disk_guard_max_db_batches = max(1, _env_int("CLIENT_DISK_GUARD_MAX_DB_BATCHES", 10))
-        self.disk_guard_min_file_age_seconds = max(
-            0,
-            _env_int("CLIENT_DISK_GUARD_MIN_FILE_AGE_SECONDS", 600),
+        self.disk_guard_interval = _env_int(
+            "CLIENT_DISK_GUARD_INTERVAL_SECONDS", 300, minimum=30
         )
-        self.sqlite_vacuum_on_disk_guard = _env_bool("CLIENT_SQLITE_VACUUM_ON_DISK_GUARD", True)
+        self.disk_guard_batch_rows = _env_int(
+            "CLIENT_DISK_GUARD_BATCH_ROWS", 5000, minimum=1
+        )
+        self.disk_guard_max_db_batches = _env_int(
+            "CLIENT_DISK_GUARD_MAX_DB_BATCHES", 10, minimum=1
+        )
+        self.disk_guard_min_file_age = _env_int(
+            "CLIENT_DISK_GUARD_MIN_FILE_AGE_SECONDS", 600, minimum=0
+        )
+        self.sqlite_vacuum_on_disk_guard = _env_bool(
+            "CLIENT_SQLITE_VACUUM_ON_DISK_GUARD", True
+        )
+        self.disk_guard_delete_unuploaded = _env_bool(
+            "CLIENT_DISK_GUARD_DELETE_UNUPLOADED", True
+        )
         self._last_disk_guard_time = 0
 
     def start(self):
@@ -163,6 +171,7 @@ class NodeAgent:
             try:
                 self._send_heartbeat()
                 self._fetch_config()
+                self._run_disk_guard_if_due()
                 self._upload_logs()
                 self._upload_whitelist_logs()
                 self._collect_container_logs()
@@ -171,7 +180,6 @@ class NodeAgent:
                 self._upload_logs()
                 self._upload_whitelist_logs()
                 self._cleanup_old_local_logs()
-                self._run_disk_guard()
             except Exception as exc:
                 print(f"Sync error: {exc}")
             time.sleep(5)
@@ -516,7 +524,8 @@ class NodeAgent:
                         if key not in metadata:
                             metadata[key] = value
 
-                    metadata["_unified_entry"] = entry
+                    # request_data/response_data already preserve the raw payload;
+                    # embedding the full event here would duplicate hex/base64 data.
 
                     insert_fn(
                         attacker_ip=src_ip,
@@ -673,22 +682,12 @@ class NodeAgent:
             label="Whitelist log",
         )
 
-    def _cleanup_old_local_logs(self):
-        now = time.time()
-        if now - self._last_log_cleanup_time < self.log_cleanup_interval:
-            return
-        self._last_log_cleanup_time = now
-        self.db.delete_old_logs(retention_days=self.log_retention_days)
-
     def _disk_usage(self):
-        check_path = self.disk_guard_path
-        if not os.path.exists(check_path):
-            check_path = "/"
+        check_path = self.disk_guard_path if os.path.exists(self.disk_guard_path) else "/"
         usage = shutil.disk_usage(check_path)
-        # Match `df` Use% by excluding filesystem-reserved blocks from the
-        # generally available denominator.
+        # Match df Use% by excluding filesystem-reserved blocks from the denominator.
         usable_total = usage.used + usage.free
-        percent = (usage.used / usable_total * 100) if usable_total else 0
+        percent = (usage.used * 100.0 / usable_total) if usable_total else 0.0
         return {
             "path": check_path,
             "total": usage.total,
@@ -698,97 +697,111 @@ class NodeAgent:
             "percent": percent,
         }
 
-    def _disk_under_target(self):
-        return self._disk_usage()["percent"] <= self.disk_usage_target_percent
+    def _delete_proxy_log_backups(self, min_age_seconds, stop_at_target=False):
+        root = Path(self.deployment_manager.node_runtime_dir) / "proxy_logs"
+        if not root.exists():
+            return {"files": 0, "bytes": 0, "errors": []}
 
-    def _iter_disk_guard_file_candidates(self):
         now = time.time()
         candidates = []
-
-        for path in Path(self.client_dir).glob("agent.log.*"):
+        for path in root.rglob("*.jsonl.*"):
+            if not path.name.rsplit(".", 1)[-1].isdigit():
+                continue
             try:
-                if path.is_file():
-                    stat = path.stat()
-                    candidates.append((stat.st_mtime, path, stat.st_size))
+                stat = path.stat()
             except OSError:
                 continue
-
-        runtime_root = Path(self.deployment_manager.node_runtime_dir)
-        targeted_roots = [runtime_root / "proxy_logs"]
-        if runtime_root.exists():
-            for deployment_root in runtime_root.iterdir():
-                if deployment_root.is_dir():
-                    targeted_roots.append(deployment_root / "logs")
-
-        for root in targeted_roots:
-            if not root.exists():
+            if now - stat.st_mtime < min_age_seconds:
                 continue
-            for path in root.rglob("*"):
-                try:
-                    if not path.is_file():
-                        continue
-                    stat = path.stat()
-                    if self.disk_guard_min_file_age_seconds and now - stat.st_mtime < self.disk_guard_min_file_age_seconds:
-                        continue
-                    candidates.append((stat.st_mtime, path, stat.st_size))
-                except OSError:
-                    continue
+            candidates.append((stat.st_mtime, path, stat.st_size))
 
-        return sorted(candidates, key=lambda item: item[0])
-
-    def _delete_oldest_local_files_for_disk_guard(self):
-        deleted_files = 0
-        deleted_bytes = 0
-        errors = []
-        for _, path, size in self._iter_disk_guard_file_candidates():
-            if self._disk_under_target():
+        result = {"files": 0, "bytes": 0, "errors": []}
+        for _mtime, path, size in sorted(candidates):
+            if stop_at_target and self._disk_usage()["percent"] <= self.disk_usage_target_percent:
                 break
             try:
                 path.unlink()
-                deleted_files += 1
-                deleted_bytes += size
+                result["files"] += 1
+                result["bytes"] += size
             except OSError as exc:
-                errors.append(f"{path}: {exc}")
-        return {
-            "files": deleted_files,
-            "bytes": deleted_bytes,
-            "errors": errors,
-        }
+                result["errors"].append(f"{path}: {exc}")
+        return result
 
-    def _run_disk_guard(self):
+    def _run_disk_guard_if_due(self):
         if not self.disk_guard_enabled:
             return
         now = time.time()
         if now - self._last_disk_guard_time < self.disk_guard_interval:
             return
         self._last_disk_guard_time = now
-        before = self._disk_usage()
+
+        try:
+            before = self._disk_usage()
+        except OSError as exc:
+            print(f"[disk-guard] Cannot inspect {self.disk_guard_path}: {exc}")
+            return
         if before["percent"] < self.disk_usage_max_percent:
             return
 
-        file_stats = self._delete_oldest_local_files_for_disk_guard()
-        db_stats = {"logs": 0, "whitelist_logs": 0, "batches": 0}
-        while not self._disk_under_target() and db_stats["batches"] < self.disk_guard_max_db_batches:
-            batch_stats = self.db.delete_oldest_logs(
+        file_stats = self._delete_proxy_log_backups(
+            self.disk_guard_min_file_age, stop_at_target=True
+        )
+        vacuum_stats = self.db.reclaim_free_space(
+            full=self.sqlite_vacuum_on_disk_guard
+        )
+
+        batches = 0
+        deleted_rows = 0
+        uploaded_only = True
+        while (
+            self._disk_usage()["percent"] > self.disk_usage_target_percent
+            and batches < self.disk_guard_max_db_batches
+        ):
+            stats = self.db.delete_oldest_logs(
                 batch_size=self.disk_guard_batch_rows,
-                vacuum=self.sqlite_vacuum_on_disk_guard,
+                uploaded_only=uploaded_only,
             )
-            db_stats["batches"] += 1
-            db_stats["logs"] += batch_stats.get("logs", 0)
-            db_stats["whitelist_logs"] += batch_stats.get("whitelist_logs", 0)
-            if not (batch_stats.get("logs", 0) or batch_stats.get("whitelist_logs", 0)):
+            count = stats.get("total", 0)
+            if count == 0 and uploaded_only and self.disk_guard_delete_unuploaded:
+                uploaded_only = False
+                continue
+            if count == 0:
                 break
+            deleted_rows += count
+            batches += 1
+            self.db.reclaim_free_space(full=False)
 
         after = self._disk_usage()
         print(
-            f"[{self.node_id}] Disk guard path={after['path']} "
-            f"before={before['percent']:.1f}% after={after['percent']:.1f}% "
-            f"max={self.disk_usage_max_percent}% target={self.disk_usage_target_percent}% "
-            f"files={file_stats.get('files', 0)} file_bytes={file_stats.get('bytes', 0)} "
-            f"db_logs={db_stats.get('logs', 0)} whitelist_logs={db_stats.get('whitelist_logs', 0)}"
+            "[disk-guard] "
+            f"usage={before['percent']:.1f}%->{after['percent']:.1f}% "
+            f"target={self.disk_usage_target_percent}% "
+            f"proxy_files={file_stats['files']} "
+            f"proxy_bytes={file_stats['bytes']} "
+            f"db_rows={deleted_rows} "
+            f"db_reclaimed={vacuum_stats.get('reclaimed_bytes', 0)}"
         )
-        for error in file_stats.get("errors", [])[:5]:
-            print(f"[{self.node_id}] Disk guard file error: {error}")
+        for error in file_stats["errors"]:
+            print(f"[disk-guard] file cleanup error: {error}")
+        if vacuum_stats.get("error"):
+            print(f"[disk-guard] SQLite reclaim error: {vacuum_stats['error']}")
+
+    def _cleanup_old_local_logs(self):
+        now = time.time()
+        if now - self._last_log_cleanup_time < self.log_cleanup_interval:
+            return
+        self._last_log_cleanup_time = now
+        self.db.delete_old_logs(retention_days=self.log_retention_days)
+        self._delete_proxy_log_backups(
+            min_age_seconds=self.log_retention_days * 86400,
+            stop_at_target=False,
+        )
+        if self.sqlite_vacuum_on_disk_guard:
+            stats = self.db.reclaim_free_space(full=True)
+            if stats.get("reclaimed_bytes", 0):
+                print(f"[LogDB] Reclaimed {stats['reclaimed_bytes']} SQLite bytes")
+            if stats.get("error"):
+                print(f"[LogDB] SQLite reclaim error: {stats['error']}")
 
     def _fetch_config(self):
         try:

@@ -14,6 +14,15 @@ class DockerDeploymentManager:
         self.runtime_root = os.path.join(client_dir, "runtime")
         self.status = {}
         self._pending_rematerialize = set()
+        log_max_size = os.environ.get("DOCKER_LOG_MAX_SIZE", "10m").strip().lower()
+        if not re.fullmatch(r"[1-9][0-9]*[kmg]?", log_max_size):
+            log_max_size = "10m"
+        try:
+            log_max_file = max(1, int(os.environ.get("DOCKER_LOG_MAX_FILE", "3")))
+        except (TypeError, ValueError):
+            log_max_file = 3
+        self.docker_log_max_size = log_max_size
+        self.docker_log_max_file = str(log_max_file)
         self.set_node_id(node_id)
         os.makedirs(self.runtime_root, exist_ok=True)
 
@@ -185,6 +194,9 @@ class DockerDeploymentManager:
             "docker", "run", "-d",
             "--name", container_name,
             "--restart", "unless-stopped",
+            "--log-driver", "json-file",
+            "--log-opt", f"max-size={self.docker_log_max_size}",
+            "--log-opt", f"max-file={self.docker_log_max_file}",
             "-e", "HONEYPOT_LOGS_DIR=/honeypot/logs",
             "-e", "HONEYPOT_DATA_DIR=/honeypot/data",
             "-v", f"{self._logs_root(deployment)}:/honeypot/logs",
@@ -305,6 +317,11 @@ class DockerDeploymentManager:
             unique_name = f"{self._project_name(deployment)}-{self._slug(service_name)}"
             lines.append(f"  {service_name}:")
             lines.append(f"    container_name: {json.dumps(unique_name)}")
+            lines.append("    logging:")
+            lines.append("      driver: json-file")
+            lines.append("      options:")
+            lines.append(f"        max-size: {json.dumps(self.docker_log_max_size)}")
+            lines.append(f"        max-file: {json.dumps(self.docker_log_max_file)}")
 
         with open(override_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")

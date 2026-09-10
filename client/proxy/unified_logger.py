@@ -3,6 +3,7 @@ Unified Logger for Honeypot Traffic
 Provides a standardized log format for all protocols to enable cross-protocol analysis.
 """
 
+import base64
 import json
 import os
 import uuid
@@ -154,13 +155,75 @@ class UnifiedLogger:
         self.node_id = node_id
         self.deployment_id = deployment_id
         self.filename = filename
-        self.max_file_size_bytes = max_file_size_mb * 1024 * 1024
-        self.backup_count = backup_count
+        self.max_file_size_bytes = self._env_int(
+            "PROXY_LOG_MAX_FILE_SIZE_MB", max_file_size_mb, minimum=1
+        ) * 1024 * 1024
+        self.backup_count = self._env_int(
+            "PROXY_LOG_BACKUP_COUNT", backup_count, minimum=1
+        )
+        self.max_payload_bytes = self._env_int(
+            "PROXY_LOG_MAX_PAYLOAD_BYTES", 65536, minimum=1024
+        )
+        self.include_base64 = os.environ.get(
+            "PROXY_LOG_INCLUDE_BASE64", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
         
         self._lock = Lock()
         self._sessions: dict[str, SessionInfo] = {}
         
         os.makedirs(log_dir, exist_ok=True)
+        self._prune_excess_backups()
+
+    @staticmethod
+    def _env_int(name: str, default: int, minimum: int = 0) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, value)
+
+    def _prune_excess_backups(self):
+        """Remove rotated JSONL generations beyond the configured count."""
+        prefix = f"{self.filename}."
+        try:
+            names = os.listdir(self.log_dir)
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith(prefix):
+                continue
+            suffix = name[len(prefix):]
+            if not suffix.isdigit() or int(suffix) <= self.backup_count:
+                continue
+            try:
+                os.remove(os.path.join(self.log_dir, name))
+            except OSError:
+                pass
+
+    def _limit_payload(self, entry: LogEntry, field_name: str):
+        payload = getattr(entry, field_name)
+        raw_hex = payload.raw_hex or ""
+        captured_bytes = len(raw_hex) // 2
+        if captured_bytes > self.max_payload_bytes:
+            payload.raw_hex = raw_hex[: self.max_payload_bytes * 2]
+            capture_meta = entry.metadata.setdefault("payload_capture", {})
+            capture_meta[f"{field_name}_original_bytes"] = captured_bytes
+            capture_meta[f"{field_name}_captured_bytes"] = self.max_payload_bytes
+
+        if self.include_base64:
+            if captured_bytes > self.max_payload_bytes:
+                try:
+                    payload.raw_base64 = base64.b64encode(
+                        bytes.fromhex(payload.raw_hex)
+                    ).decode("ascii")
+                except ValueError:
+                    payload.raw_base64 = ""
+        else:
+            payload.raw_base64 = ""
+
+    def _prepare_entry(self, entry: LogEntry):
+        self._limit_payload(entry, "request")
+        self._limit_payload(entry, "response")
     
     @property
     def log_path(self) -> str:
@@ -168,6 +231,7 @@ class UnifiedLogger:
     
     def _rotate_if_needed(self):
         """Rotate log file if it exceeds max size"""
+        self._prune_excess_backups()
         if not os.path.exists(self.log_path):
             return
         
@@ -201,6 +265,7 @@ class UnifiedLogger:
             entry.deployment_id = self.deployment_id
         
         with self._lock:
+            self._prepare_entry(entry)
             self._rotate_if_needed()
             
             with open(self.log_path, "a", encoding="utf-8") as f:
@@ -226,8 +291,6 @@ class UnifiedLogger:
         Convenience method to log raw traffic data.
         Automatically converts bytes to hex and base64.
         """
-        import base64
-        
         entry = LogEntry(
             node_id=self.node_id,
             deployment_id=self.deployment_id,

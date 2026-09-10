@@ -3,6 +3,7 @@ import json
 import threading
 from datetime import datetime, timedelta
 import os
+import shutil
 from ip_filter import drop_private_ip_logs_enabled, is_internal_ip
 
 class LogDB:
@@ -14,9 +15,12 @@ class LogDB:
 
     def _init_db(self):
         with self._lock:
+            new_database = not os.path.exists(self.db_path) or os.path.getsize(self.db_path) == 0
             conn = sqlite3.connect(self.db_path)
             try:
                 cursor = conn.cursor()
+                if new_database:
+                    cursor.execute('PRAGMA auto_vacuum = INCREMENTAL')
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS logs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,6 +173,9 @@ class LogDB:
                     deleted_whitelist_logs += cursor.rowcount if cursor.rowcount is not None else 0
                 conn.commit()
                 total = deleted_logs + deleted_whitelist_logs
+                if total and cursor.execute('PRAGMA auto_vacuum').fetchone()[0] == 2:
+                    cursor.execute('PRAGMA incremental_vacuum')
+                    conn.commit()
                 if total:
                     print(
                         f"[LogDB] Deleted {total} local logs older than {retention_days} days "
@@ -186,68 +193,90 @@ class LogDB:
                 if conn:
                     conn.close()
 
-    def delete_oldest_logs(self, batch_size=5000, vacuum=False):
-        """Delete oldest local rows in bounded batches.
-
-        Used by the disk guard when the host crosses the configured disk usage
-        threshold. VACUUM is optional because it can be expensive, but it is the
-        only way SQLite returns deleted pages to the filesystem immediately.
-        """
+    def delete_oldest_logs(self, batch_size=5000, uploaded_only=True):
+        """Delete the oldest local rows, preferring data already uploaded."""
         try:
-            batch_size = int(batch_size)
+            batch_size = max(1, min(int(batch_size), 100000))
         except (TypeError, ValueError):
             batch_size = 5000
-        batch_size = max(1, min(batch_size, 100000))
 
         with self._lock:
             conn = None
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = sqlite3.connect(self.db_path, timeout=30)
                 cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    DELETE FROM logs
-                    WHERE id IN (
-                        SELECT id FROM logs
-                        ORDER BY timestamp ASC, id ASC
-                        LIMIT ?
+                remaining = batch_size
+                deleted = {"logs": 0, "whitelist_logs": 0}
+                where = "WHERE uploaded = 1" if uploaded_only else ""
+                for table in ("logs", "whitelist_logs"):
+                    if remaining <= 0:
+                        break
+                    cursor.execute(
+                        f"DELETE FROM {table} WHERE id IN ("
+                        f"SELECT id FROM {table} {where} ORDER BY id ASC LIMIT ?)",
+                        (remaining,),
                     )
-                    """,
-                    (batch_size,),
-                )
-                deleted_logs = cursor.rowcount if cursor.rowcount is not None else 0
-                cursor.execute(
-                    """
-                    DELETE FROM whitelist_logs
-                    WHERE id IN (
-                        SELECT id FROM whitelist_logs
-                        ORDER BY timestamp ASC, id ASC
-                        LIMIT ?
-                    )
-                    """,
-                    (batch_size,),
-                )
-                deleted_whitelist_logs = cursor.rowcount if cursor.rowcount is not None else 0
+                    count = max(0, cursor.rowcount or 0)
+                    deleted[table] = count
+                    remaining -= count
                 conn.commit()
-                if vacuum and (deleted_logs or deleted_whitelist_logs):
-                    cursor.execute("VACUUM")
-                if deleted_logs or deleted_whitelist_logs:
-                    print(
-                        f"[LogDB] Disk guard deleted local rows "
-                        f"(logs={deleted_logs}, whitelist_logs={deleted_whitelist_logs})"
-                    )
-                return {
-                    "logs": deleted_logs,
-                    "whitelist_logs": deleted_whitelist_logs,
-                    "batch_size": batch_size,
-                }
-            except sqlite3.Error as e:
-                print(f"[LogDB] Error deleting oldest logs: {e}")
+                deleted["total"] = deleted["logs"] + deleted["whitelist_logs"]
+                deleted["uploaded_only"] = uploaded_only
+                return deleted
+            except sqlite3.Error as exc:
                 return {
                     "logs": 0,
                     "whitelist_logs": 0,
-                    "batch_size": batch_size,
-                    "error": str(e),
+                    "total": 0,
+                    "uploaded_only": uploaded_only,
+                    "error": str(exc),
+                }
+            finally:
+                if conn:
+                    conn.close()
+
+    def reclaim_free_space(self, full=False):
+        """Return unused SQLite pages to the filesystem.
+
+        New databases use incremental auto-vacuum. Existing databases can be
+        migrated with one full VACUUM when enough temporary disk space exists.
+        """
+        with self._lock:
+            conn = None
+            before = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=60)
+                mode = conn.execute('PRAGMA auto_vacuum').fetchone()[0]
+                if mode == 2:
+                    conn.execute('PRAGMA incremental_vacuum')
+                    conn.commit()
+                elif full:
+                    db_dir = os.path.dirname(os.path.abspath(self.db_path)) or "."
+                    free_bytes = shutil.disk_usage(db_dir).free
+                    required_bytes = before + 64 * 1024 * 1024
+                    if free_bytes <= required_bytes:
+                        return {
+                            "before_bytes": before,
+                            "after_bytes": before,
+                            "mode": mode,
+                            "error": "insufficient free space for full VACUUM",
+                        }
+                    conn.execute('PRAGMA auto_vacuum = INCREMENTAL')
+                    conn.execute('VACUUM')
+                    mode = conn.execute('PRAGMA auto_vacuum').fetchone()[0]
+                after = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
+                return {
+                    "before_bytes": before,
+                    "after_bytes": after,
+                    "reclaimed_bytes": max(0, before - after),
+                    "mode": mode,
+                }
+            except sqlite3.Error as exc:
+                return {
+                    "before_bytes": before,
+                    "after_bytes": os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0,
+                    "mode": None,
+                    "error": str(exc),
                 }
             finally:
                 if conn:

@@ -267,8 +267,9 @@ CLIENT_DISK_USAGE_TARGET_PERCENT=75
 
 若 Agent 與 Server 位於不同主機，請將 `server_url` 改成 Server 的實際 IP 或網域。如果 `server/.env` 使用自訂 `SERVER_PORT`，這裡的 `server_url` 也要使用相同 port。
 `DROP_PRIVATE_IP_LOGS=true` 會讓 Agent 在寫入 proxy JSONL 與本地 SQLite 前丟棄 `127.0.0.1`、`172.16.0.0/12`、`192.168.0.0/16`、`10.0.0.0/8` 等內部 IP 流量。
-`CLIENT_DISK_GUARD_ENABLED=true` 會在磁碟使用率達到 `CLIENT_DISK_USAGE_MAX_PERCENT` 時，從最舊的 Agent 旋轉 log、runtime/proxy log 與本地 SQLite rows 開始清除，並可透過 `CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true` 讓 SQLite 立即釋放檔案空間。
 `AGENT_DAEMON_LOG_MODE=errors` 會讓背景模式只把 stderr/error traceback 寫入 `agent.log`；如需完整 stdout/stderr 可改為 `full`，完全不寫可改為 `off`。`AGENT_DAEMON_LOG_MAX_BYTES` 與 `AGENT_DAEMON_LOG_BACKUP_COUNT` 控制 `agent.log` 大小輪替。
+
+Client 磁碟保護預設在根檔案系統使用率達 80% 時啟動，依時間由舊到新清除 proxy 輪替檔與本機 SQLite 紀錄，直到使用率接近 75%。系統會先清除已上傳紀錄；必要時才清除最舊的未上傳紀錄。`PROXY_LOG_MAX_FILE_SIZE_MB`、`PROXY_LOG_BACKUP_COUNT` 與 `PROXY_LOG_MAX_PAYLOAD_BYTES` 限制 raw proxy 日誌，`DOCKER_LOG_MAX_SIZE` 與 `DOCKER_LOG_MAX_FILE` 限制容器 json-file 日誌。SQLite 使用增量 auto-vacuum，刪除資料後會把空頁歸還檔案系統。智慧路燈的 MongoDB `command_logs` 由 `MONGO_LOG_RETENTION_DAYS` 控制保留天數（預設 30 天）；服務啟動時先刪除逾期舊資料，再以 TTL 索引持續自動清理。
 
 ### 5. 啟動 Server 與分析服務
 

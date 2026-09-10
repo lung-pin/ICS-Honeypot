@@ -31,6 +31,7 @@ if _SOCKETIO_ASYNC_MODE == "eventlet":
 
 import json
 import random
+from datetime import datetime, timedelta, timezone
 import re
 import socket
 import time
@@ -121,9 +122,52 @@ SIM_LIGHT_RANDOM_MAX = _env_int("SIM_LIGHT_RANDOM_MAX", 100, 0, 100)
 if SIM_LIGHT_RANDOM_MAX < SIM_LIGHT_RANDOM_MIN:
     SIM_LIGHT_RANDOM_MIN, SIM_LIGHT_RANDOM_MAX = SIM_LIGHT_RANDOM_MAX, SIM_LIGHT_RANDOM_MIN
 SIM_LIGHT_RANDOM_BUCKET_SECONDS = _env_int("SIM_LIGHT_RANDOM_BUCKET_SECONDS", 300, 1, 86400)
+MONGO_LOG_RETENTION_DAYS = _env_int("MONGO_LOG_RETENTION_DAYS", 30, 1, 3650)
 
 
-# ---------- MongoDB read-only helper ----------
+# ---------- MongoDB helper ----------
+
+def _ensure_command_log_retention(collection):
+    """Delete expired legacy rows first, then enable TTL for all retained/new rows."""
+    retention_seconds = MONGO_LOG_RETENTION_DAYS * 86400
+    cutoff = datetime.now(timezone.utc) - timedelta(days=MONGO_LOG_RETENTION_DAYS)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+    deleted = collection.delete_many(
+        {"created_at": {"$exists": False}, "ts": {"$lt": cutoff_iso}}
+    ).deleted_count
+    if deleted:
+        print(f"[Subscriber] [MongoDB] 已刪除 {deleted} 筆逾期 command_logs")
+
+    collection.update_many(
+        {"created_at": {"$exists": False}},
+        [
+            {
+                "$set": {
+                    "created_at": {
+                        "$convert": {
+                            "input": "$ts",
+                            "to": "date",
+                            "onError": {"$toDate": "$_id"},
+                            "onNull": {"$toDate": "$_id"},
+                        }
+                    }
+                }
+            }
+        ],
+    )
+
+    ttl_name = "created_at_ttl"
+    ttl_index = collection.index_information().get(ttl_name)
+    if ttl_index and ttl_index.get("expireAfterSeconds") != retention_seconds:
+        collection.drop_index(ttl_name)
+    collection.create_index(
+        "created_at",
+        expireAfterSeconds=retention_seconds,
+        name=ttl_name,
+    )
+
+
 
 mongo_client = None
 mongo_db = None
@@ -171,6 +215,7 @@ def _ensure_mongo():
             client.admin.command("ping")
             mongo_client = client
             mongo_db = client[MONGO_DB]
+            _ensure_command_log_retention(mongo_db["command_logs"])
             print(f"[Subscriber] [MongoDB] 已連線 {MONGO_URI} db={MONGO_DB}")
         except PyMongoError as e:
             print(f"[Subscriber] [MongoDB] 連線失敗 {MONGO_URI}: {e}")
@@ -962,6 +1007,7 @@ def api_post_command():
             db["command_logs"].insert_one(
                 {
                     "ts": now_iso,
+                    "created_at": datetime.now(timezone.utc),
                     "destination": "gateway",
                     "source": source,
                     "hex_data": hex_data,

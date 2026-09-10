@@ -440,6 +440,17 @@ CLIENT_DISK_GUARD_BATCH_ROWS=5000
 CLIENT_DISK_GUARD_MAX_DB_BATCHES=10
 CLIENT_DISK_GUARD_MIN_FILE_AGE_SECONDS=600
 CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true
+CLIENT_DISK_GUARD_DELETE_UNUPLOADED=true
+
+# Bound raw proxy logs and per-event payload capture.
+PROXY_LOG_MAX_FILE_SIZE_MB=20
+PROXY_LOG_BACKUP_COUNT=2
+PROXY_LOG_MAX_PAYLOAD_BYTES=65536
+PROXY_LOG_INCLUDE_BASE64=false
+
+# Bound Docker json-file logs for every managed container.
+DOCKER_LOG_MAX_SIZE=10m
+DOCKER_LOG_MAX_FILE=3
 EOF
     warn "⚠️  Edit client/.env and set API_KEY to match the server!"
 fi
@@ -458,8 +469,35 @@ CLIENT_DISK_GUARD_BATCH_ROWS=5000
 CLIENT_DISK_GUARD_MAX_DB_BATCHES=10
 CLIENT_DISK_GUARD_MIN_FILE_AGE_SECONDS=600
 CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true
+CLIENT_DISK_GUARD_DELETE_UNUPLOADED=true
 EOF
     ok "Added disk guard defaults to client/.env."
+fi
+
+if ! grep -qE "^CLIENT_DISK_GUARD_DELETE_UNUPLOADED=" "$SCRIPT_DIR/.env"; then
+    printf '\nCLIENT_DISK_GUARD_DELETE_UNUPLOADED=true\n' >> "$SCRIPT_DIR/.env"
+fi
+
+if ! grep -qE "^PROXY_LOG_MAX_FILE_SIZE_MB=" "$SCRIPT_DIR/.env"; then
+    cat >> "$SCRIPT_DIR/.env" <<'EOF'
+
+# Bound raw proxy logs and per-event payload capture.
+PROXY_LOG_MAX_FILE_SIZE_MB=20
+PROXY_LOG_BACKUP_COUNT=2
+PROXY_LOG_MAX_PAYLOAD_BYTES=65536
+PROXY_LOG_INCLUDE_BASE64=false
+EOF
+    ok "Added proxy log limits to client/.env."
+fi
+
+if ! grep -qE "^DOCKER_LOG_MAX_SIZE=" "$SCRIPT_DIR/.env"; then
+    cat >> "$SCRIPT_DIR/.env" <<'EOF'
+
+# Bound Docker json-file logs for every managed container.
+DOCKER_LOG_MAX_SIZE=10m
+DOCKER_LOG_MAX_FILE=3
+EOF
+    ok "Added Docker log limits to client/.env."
 fi
 
 if [ ! -f "$SCRIPT_DIR/client_config.json" ]; then

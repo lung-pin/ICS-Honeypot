@@ -210,8 +210,9 @@ Check `client/client_config.json` for `node_id` and `server_url`:
 
 If the Agent and Server are on different machines, change `server_url` to the Server's actual IP address or domain. If `server/.env` uses a custom `SERVER_PORT`, this `server_url` must use the same port.
 `DROP_PRIVATE_IP_LOGS=true` makes the Agent discard internal IP traffic such as `127.0.0.1`, `172.16.0.0/12`, `192.168.0.0/16`, and `10.0.0.0/8` before writing proxy JSONL or local SQLite logs.
-`CLIENT_DISK_GUARD_ENABLED=true` starts a disk guard when usage reaches `CLIENT_DISK_USAGE_MAX_PERCENT`; it deletes the oldest rotated Agent logs, runtime/proxy logs, and local SQLite rows. `CLIENT_SQLITE_VACUUM_ON_DISK_GUARD=true` makes SQLite release deleted space back to the filesystem.
 `AGENT_DAEMON_LOG_MODE=errors` makes daemon mode write only stderr/error tracebacks to `agent.log`; use `full` for stdout+stderr or `off` to disable agent log output. `AGENT_DAEMON_LOG_MAX_BYTES` and `AGENT_DAEMON_LOG_BACKUP_COUNT` control `agent.log` rotation.
+
+The Client disk guard starts when root filesystem usage reaches 80%. It removes proxy backups and local SQLite rows from oldest to newest until usage approaches 75%, deleting uploaded rows before unuploaded rows. `PROXY_LOG_MAX_FILE_SIZE_MB`, `PROXY_LOG_BACKUP_COUNT`, and `PROXY_LOG_MAX_PAYLOAD_BYTES` bound raw proxy logs. `DOCKER_LOG_MAX_SIZE` and `DOCKER_LOG_MAX_FILE` bound container json-file logs. SQLite uses incremental auto-vacuum so deleted pages are returned to the filesystem. `MONGO_LOG_RETENTION_DAYS` controls Smart Streetlight MongoDB `command_logs` retention (30 days by default); startup deletes expired legacy rows first, then a TTL index keeps expiring old rows automatically.
 
 ### 5. Start the Server and Analysis Services
 
